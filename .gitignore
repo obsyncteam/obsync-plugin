@@ -1,0 +1,7 @@
+node_modules/
+main.js
+dist/
+*.zip
+.env
+.DS_Store
+npm-debug.log*

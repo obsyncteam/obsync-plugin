@@ -1,0 +1,101 @@
+.obsync-settings-intro {
+  margin-top: 18px;
+  margin-bottom: 14px;
+  padding-left: 16px;
+  max-width: 760px;
+}
+
+.obsync-settings-intro > p {
+  margin: 0;
+  font-size: var(--font-ui-small);
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.obsync-settings-section {
+  margin-top: 14px;
+}
+
+.obsync-progress-description {
+  white-space: pre-line;
+}
+
+.obsync-share-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.obsync-share-row .nav-file-title-content,
+.obsync-share-row .nav-folder-title-content {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.obsync-share-indicator {
+  position: relative;
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+  margin-left: auto;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  opacity: 0.78;
+  pointer-events: auto;
+  transition: color 120ms ease, opacity 120ms ease;
+}
+
+.obsync-share-indicator::before,
+.obsync-share-indicator::after {
+  content: "";
+  position: absolute;
+  box-sizing: border-box;
+  border: 1.4px solid currentColor;
+  border-radius: 2px;
+  width: 8px;
+  height: 10px;
+  transform: none;
+}
+
+.obsync-share-indicator::before {
+  left: 4px;
+  top: 3px;
+  background: var(--background-primary);
+}
+
+.obsync-share-indicator::after {
+  left: 7px;
+  top: 6px;
+  background: var(--background-primary);
+}
+
+.obsync-share-indicator-folder::before {
+  left: 3px;
+  top: 5px;
+  width: 12px;
+  height: 9px;
+  border-radius: 2px;
+}
+
+.obsync-share-indicator-folder::after {
+  left: 5px;
+  top: 3px;
+  width: 6px;
+  height: 4px;
+  border-bottom: 0;
+  border-radius: 2px 2px 0 0;
+}
+
+.obsync-share-row:hover .obsync-share-indicator,
+.obsync-share-indicator:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.obsync-share-indicator:hover {
+  color: var(--interactive-accent);
+  opacity: 1;
+}

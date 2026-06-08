@@ -1,0 +1,10 @@
+{
+  "id": "obsync",
+  "name": "obsync",
+  "version": "1.6.8",
+  "minAppVersion": "1.5.0",
+  "description": "Lightweight sync for Obsidian.",
+  "author": "obsync team",
+  "authorUrl": "https://obsync.ru",
+  "isDesktopOnly": false
+}
