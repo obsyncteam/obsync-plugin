@@ -5,7 +5,7 @@
 [![Version](https://img.shields.io/badge/version-1.6.9-green.svg)](manifest.json)
 [![AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 
-Obsidian plugin for Obsync sync. It connects an Obsidian vault to a [self-hosted Obsync Community Edition server](https://obsync.ru/ce?utm_source=github&utm_medium=repo_readme) or to the [hosted Obsync service](https://obsync.ru/?utm_source=github&utm_medium=repo_readme), then keeps Markdown notes, folders, attachments and recent Markdown history in sync across desktop and mobile.
+Obsidian plugin for Obsync sync. It connects an Obsidian vault to a [self-hosted Obsync Community Edition server](https://obsync.ru/ce?utm_source=github&utm_medium=repo_readme) or to the [hosted Obsync service](https://obsync.ru/?utm_source=github&utm_medium=repo_readme).
 
 ## Links
 
