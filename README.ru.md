@@ -1,22 +1,47 @@
-# obsync Obsidian Plugin
+# Плагин obsync для Obsidian
 
 [English version](README.md)
 
-[![Версия](https://img.shields.io/badge/version-1.6.8-green.svg)](manifest.json)
+[![Версия](https://img.shields.io/badge/version-1.6.9-green.svg)](manifest.json)
 [![AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 
-Плагин Obsidian для синхронизации obsync.
+Плагин Obsidian для obsync. Он подключает хранилище Obsidian к self-hosted серверу obsync Community Edition или к облачному сервису obsync, а затем синхронизирует Markdown-заметки, папки, вложения и последние версии Markdown-заметок между компьютером и телефоном.
 
-## Репозитории
+## Ссылки
 
-- Репозиторий плагина: <https://github.com/obsyncteam/obsync-plugin>
-- Сервер Community Edition: <https://github.com/obsyncteam/obsync-ce>
-- Сайт: [https://obsync.ru](https://obsync.ru/?utm_source=github&utm_medium=repo_readme) (международная версия сайта еще в разработке)
+- Сайт проекта: [obsync.ru](https://obsync.ru/?utm_source=github&utm_medium=repo_readme) (международная версия сайта еще в разработке)
+- Страница Community Edition: [obsync.ru/ce](https://obsync.ru/ce?utm_source=github&utm_medium=repo_readme)
+- Репозиторий сервера Community Edition: <https://github.com/obsyncteam/obsync-ce>
+- Релизы плагина: <https://github.com/obsyncteam/obsync-plugin/releases>
+
+## Установка из релиза
+
+Скачайте архив релиза:
+
+```text
+obsync_v1.6.9.zip
+```
+
+Распакуйте его в хранилище Obsidian:
+
+```text
+<хранилище>/.obsidian/plugins/obsync/
+```
+
+Ожидаемая структура папки:
+
+```text
+obsync/main.js
+obsync/manifest.json
+obsync/styles.css
+```
+
+Перезапустите Obsidian или перезагрузите приложение, затем включите `obsync` в Community plugins.
 
 ## Режимы подключения
 
-- **Obsync service.** Используйте [https://obsync.ru](https://obsync.ru/?utm_source=github&utm_medium=repo_readme), вставьте ключ плагина из личного кабинета и нажмите `Синхронизировать`.
-- **Community Edition.** Используйте адрес своего sync-сервера, например `http://127.0.0.1:4444`, LAN-адрес или HTTPS-домен.
+- **obsync Community Edition.** Используйте адрес своего сервера: локальный адрес, LAN-адрес или публичный HTTPS-домен.
+- **Облачный сервис obsync.** Используйте [https://obsync.ru](https://obsync.ru/?utm_source=github&utm_medium=repo_readme), вставьте ключ плагина из личного кабинета и нажмите `Синхронизировать`.
 
 ## Возможности
 
@@ -26,18 +51,17 @@
 - История изменений Markdown-заметок на сервере.
 - Опциональная синхронизация `.obsidian` выключена по умолчанию.
 - Защита локальных данных плагина obsync от циклической синхронизации.
-- Управление публикацией заметок и папок для аккаунтов Obsync service.
+- Управление публикацией заметок и папок, если публикация доступна в подключенном аккаунте obsync.
 
-## Сборка
+## Сборка из исходников
 
 ```bash
 npm ci
 npm run typecheck
-npm test
 npm run build
 ```
 
-Production-сборка создает `main.js`.
+Сборка создает `main.js`.
 
 ## Архив для ручной установки
 
@@ -48,7 +72,7 @@ npm run pack
 Имя архива:
 
 ```text
-obsync_v1.6.8.zip
+obsync_v1.6.9.zip
 ```
 
 Структура архива:
@@ -58,23 +82,6 @@ obsync/main.js
 obsync/manifest.json
 obsync/styles.css
 ```
-
-## Assets для Obsidian Release
-
-Для GitHub Release, который использует Obsidian, прикрепите:
-
-- `main.js`
-- `manifest.json`
-- `styles.css`
-
-Release tag должен совпадать с версией в `manifest.json`.
-
-## Disclosures
-
-- Network: плагин отправляет sync metadata и содержимое файлов на настроенный Server URL или на sync route Obsync service, полученный по account token.
-- File access: плагин читает, создает, обновляет, переименовывает и удаляет файлы внутри текущего Obsidian vault через Obsidian APIs.
-- Token storage: access token хранится в plugin data этого vault. Это не пароль аккаунта.
-- Payments: плагин может подключаться к аккаунтам Obsync service. Community Edition можно запускать отдельно на своем сервере.
 
 ## Лицензия
 
