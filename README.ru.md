@@ -1,11 +1,11 @@
-# Плагин obsync для Obsidian
+# Плагин Obsync для Obsidian
 
 [English version](README.md)
 
 [![Версия](https://img.shields.io/badge/version-1.6.9-green.svg)](manifest.json)
 [![AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 
-Плагин Obsidian для obsync. Он подключает хранилище Obsidian к self-hosted серверу obsync Community Edition или к облачному сервису obsync, а затем синхронизирует Markdown-заметки, папки, вложения и последние версии Markdown-заметок между компьютером и телефоном.
+Плагин Obsidian для Obsync. Он подключает хранилище Obsidian к [self-hosted серверу Obsync Community Edition](https://obsync.ru/ce?utm_source=github&utm_medium=repo_readme) или к [облачному сервису Obsync](https://obsync.ru/?utm_source=github&utm_medium=repo_readme), а затем синхронизирует Markdown-заметки, папки, вложения и последние версии Markdown-заметок между компьютером и телефоном.
 
 ## Ссылки
 
@@ -36,12 +36,12 @@ obsync/manifest.json
 obsync/styles.css
 ```
 
-Перезапустите Obsidian или перезагрузите приложение, затем включите `obsync` в Community plugins.
+Перезапустите Obsidian или перезагрузите приложение, затем включите Obsync в Community plugins.
 
 ## Режимы подключения
 
-- **obsync Community Edition.** Используйте адрес своего сервера: локальный адрес, LAN-адрес или публичный HTTPS-домен.
-- **Облачный сервис obsync.** Используйте [https://obsync.ru](https://obsync.ru/?utm_source=github&utm_medium=repo_readme), вставьте ключ плагина из личного кабинета и нажмите `Синхронизировать`.
+- **Obsync Community Edition.** Используйте адрес своего сервера: локальный адрес, LAN-адрес или публичный HTTPS-домен.
+- **Облачный сервис Obsync.** Используйте [https://obsync.ru](https://obsync.ru/?utm_source=github&utm_medium=repo_readme), вставьте ключ плагина из личного кабинета и нажмите `Синхронизировать`.
 
 ## Возможности
 
@@ -50,8 +50,8 @@ obsync/styles.css
 - Начальная загрузка, начальное скачивание, переподключение и обычная синхронизация.
 - История изменений Markdown-заметок на сервере.
 - Опциональная синхронизация `.obsidian` выключена по умолчанию.
-- Защита локальных данных плагина obsync от циклической синхронизации.
-- Управление публикацией заметок и папок, если публикация доступна в подключенном аккаунте obsync.
+- Защита локальных данных плагина Obsync от циклической синхронизации.
+- Управление публикацией заметок и папок, если публикация доступна в подключенном аккаунте Obsync.
 
 ## Сборка из исходников
 
@@ -85,4 +85,4 @@ obsync/styles.css
 
 ## Лицензия
 
-obsync Obsidian Plugin распространяется под лицензией `AGPL-3.0-only`.
+Obsync Obsidian Plugin распространяется под лицензией `AGPL-3.0-only`.

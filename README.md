@@ -1,11 +1,11 @@
-# obsync Obsidian Plugin
+# Obsync Obsidian Plugin
 
 [Русская версия](README.ru.md)
 
 [![Version](https://img.shields.io/badge/version-1.6.9-green.svg)](manifest.json)
 [![AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 
-Obsidian plugin for obsync sync. It connects an Obsidian vault to a self-hosted obsync Community Edition server or to the hosted obsync service, then keeps Markdown notes, folders, attachments and recent Markdown history in sync across desktop and mobile.
+Obsidian plugin for Obsync sync. It connects an Obsidian vault to a [self-hosted Obsync Community Edition server](https://obsync.ru/ce?utm_source=github&utm_medium=repo_readme) or to the [hosted Obsync service](https://obsync.ru/?utm_source=github&utm_medium=repo_readme), then keeps Markdown notes, folders, attachments and recent Markdown history in sync across desktop and mobile.
 
 ## Links
 
@@ -38,12 +38,12 @@ obsync/manifest.json
 obsync/styles.css
 ```
 
-Restart Obsidian or reload the app, then enable `obsync` in Community plugins.
+Restart Obsidian or reload the app, then enable Obsync in Community plugins.
 
 ## Connection Modes
 
-- **obsync Community Edition.** Use your own server URL: a local address, a LAN address or a public HTTPS domain.
-- **Hosted obsync service.** Use [https://obsync.ru](https://obsync.ru/?utm_source=github&utm_medium=repo_readme), paste the plugin token from your account, and press `Sync`.
+- **Obsync Community Edition.** Use your own server URL: a local address, a LAN address or a public HTTPS domain.
+- **Hosted Obsync service.** Use [https://obsync.ru](https://obsync.ru/?utm_source=github&utm_medium=repo_readme), paste the plugin token from your account, and press `Sync`.
 
 ## Features
 
@@ -52,8 +52,8 @@ Restart Obsidian or reload the app, then enable `obsync` in Community plugins.
 - Supports initial upload, initial download, reconnect and regular sync.
 - Keeps change history for Markdown notes on the server.
 - Optional `.obsidian` sync is off by default.
-- Protects local obsync plugin data from sync loops.
-- Adds note and folder publication controls when publishing is available for the connected obsync account.
+- Protects local Obsync plugin data from sync loops.
+- Adds note and folder publication controls when publishing is available for the connected Obsync account.
 
 ## Build From Source
 
@@ -87,4 +87,4 @@ obsync/styles.css
 
 ## License
 
-obsync Obsidian Plugin is licensed under `AGPL-3.0-only`.
+Obsync Obsidian Plugin is licensed under `AGPL-3.0-only`.
