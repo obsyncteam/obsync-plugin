@@ -399,8 +399,10 @@ export default class ObsyncPlugin extends Plugin {
       const tombstones = localFilesMissingOnServer.length > 0
         ? await api.tombstones()
         : [];
-      const tombstonesByPath = new Map(tombstones.map((tombstone) => [tombstone.path, tombstone]));
-      const tombstonesByFileId = new Map(tombstones.map((tombstone) => [tombstone.fileId, tombstone]));
+      const deleteContextUnavailable = localFilesMissingOnServer.length > 0 && tombstones === undefined;
+      const tombstoneRecords = tombstones ?? [];
+      const tombstonesByPath = new Map(tombstoneRecords.map((tombstone) => [tombstone.path, tombstone]));
+      const tombstonesByFileId = new Map(tombstoneRecords.map((tombstone) => [tombstone.fileId, tombstone]));
       let processedServerBytes = 0;
 
       for (let index = 0; index < serverFiles.length; index += 1) {
@@ -465,6 +467,11 @@ export default class ObsyncPlugin extends Plugin {
 
       for (const localFile of localFiles) {
         if (!serverByPath.has(localFile.path)) {
+          if (deleteContextUnavailable) {
+            preUploadSkippedFiles.push(this.skippedFile(localFile, "delete-context-unavailable"));
+            continue;
+          }
+
           const manifestFile = manifestByPath.get(localFile.path);
           if (manifestFile?.deletedAt) {
             if (this.settings.deletedServerFilePolicy === "server_wins") {
@@ -652,8 +659,6 @@ export default class ObsyncPlugin extends Plugin {
     uploadPreconditionsByPath: Map<string, UploadPreconditions>,
     skippedFiles: SkippedFileState[],
   ): Promise<boolean> {
-    if (this.settings.deletedServerFilePolicy === "local_wins") return false;
-
     const knownFileId = this.settings.fileIds[file.path];
     const lastHash = this.settings.lastFileHashes[file.path];
     const lastSeq = this.settings.lastFileSeqs[file.path];

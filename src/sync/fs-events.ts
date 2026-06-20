@@ -134,7 +134,7 @@ export class VaultEventBridge {
     if (!path || this.shouldIgnore(path)) return;
 
     if (operation.operationType === "delete") {
-      await this.applyDelete(path);
+      await this.applyRemoteDelete(path);
       delete this.getSettings().lastFileHashes[path];
       delete this.getSettings().lastFileSeqs[path];
       delete this.getSettings().fileIds[path];
@@ -530,6 +530,43 @@ export class VaultEventBridge {
     await this.vault.delete(existing, true);
   }
 
+  private async applyRemoteDelete(path: string): Promise<void> {
+    const existing = this.vault.getAbstractFileByPath(path);
+    if (!existing) return;
+
+    if (existing instanceof TFolder) {
+      if (existing.children.length === 0) {
+        await this.applyDelete(path);
+      }
+      return;
+    }
+
+    if (!(existing instanceof TFile)) return;
+
+    const lastHash = this.getSettings().lastFileHashes[path];
+    if (!lastHash) {
+      await this.renameRemoteDeleteConflict(existing);
+      return;
+    }
+
+    const localHash = await this.fileHash(existing);
+    if (localHash === lastHash) {
+      await this.applyDelete(path);
+      return;
+    }
+
+    await this.renameRemoteDeleteConflict(existing, localHash);
+  }
+
+  private async renameRemoteDeleteConflict(file: TFile, hash?: string): Promise<void> {
+    const conflictPath = this.uniqueConflictPath(file.path, hash);
+    await this.ensureParentFolders(conflictPath);
+    this.echoSuppression.suppress(file.path);
+    this.echoSuppression.suppress(conflictPath);
+    await this.vault.rename(file, conflictPath);
+    new Notice(`obsync: kept local changes as "${conflictPath}"`);
+  }
+
   private async applyRename(path: string, newPath: string): Promise<void> {
     const existing = this.vault.getAbstractFileByPath(path);
     if (!existing) return;
@@ -648,6 +685,28 @@ export class VaultEventBridge {
       : `conflict-${new Date().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "")}`;
     if (dot <= 0) return `${path}.${suffix}`;
     return `${path.slice(0, dot)}.${suffix}${path.slice(dot)}`;
+  }
+
+  private uniqueConflictPath(path: string, hash?: string): string {
+    const base = this.conflictPath(path, hash);
+    if (!this.vault.getAbstractFileByPath(base)) return base;
+
+    const dot = base.lastIndexOf(".");
+    for (let index = 2; index < 100; index += 1) {
+      const candidate = dot <= 0
+        ? `${base}-${index}`
+        : `${base.slice(0, dot)}-${index}${base.slice(dot)}`;
+      if (!this.vault.getAbstractFileByPath(candidate)) return candidate;
+    }
+
+    return this.conflictPath(path);
+  }
+
+  private async fileHash(file: TFile): Promise<string> {
+    if (file.extension.toLowerCase() === "md") {
+      return `sha256:${await sha256Hex(await this.vault.read(file))}`;
+    }
+    return `sha256:${await sha256Hex(await this.vault.readBinary(file))}`;
   }
 
   private stagedDownloadTarget(input: {

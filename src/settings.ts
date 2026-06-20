@@ -5,7 +5,7 @@ import { t } from "./i18n";
 
 export type SetupMode = "primary" | "secondary";
 export type SyncBackend = "standalone" | "hosted";
-export type DeletedServerFilePolicy = "local_wins" | "server_wins" | "conflict_copy";
+export type DeletedServerFilePolicy = "server_wins" | "conflict_copy";
 
 export interface PendingUploadState {
   uploadId: string;
@@ -29,7 +29,7 @@ export interface PendingUploadState {
 export interface SkippedFileState {
   path: string;
   sizeBytes: number;
-  reason: "large" | "attachments-disabled" | "server-deleted";
+  reason: "large" | "attachments-disabled" | "server-deleted" | "delete-context-unavailable";
   skippedAt: number;
 }
 
@@ -245,7 +245,7 @@ function normalizePublishFolder(value: string): string {
 
 function normalizeDeletedServerFilePolicy(value: unknown): DeletedServerFilePolicy {
   if (value === "server_wins" || value === "conflict_copy") return value;
-  return "local_wins";
+  return "server_wins";
 }
 
 export class ObsyncSettingTab extends PluginSettingTab {
@@ -419,7 +419,6 @@ export class ObsyncSettingTab extends PluginSettingTab {
         dropdown
           .addOption("server_wins", t("settings_deleted_file_policy_server_wins"))
           .addOption("conflict_copy", t("settings_deleted_file_policy_conflict_copy"))
-          .addOption("local_wins", t("settings_deleted_file_policy_local_wins"))
           .setValue(this.plugin.settings.deletedServerFilePolicy)
           .onChange(async (value) => {
             this.plugin.settings.deletedServerFilePolicy = normalizeDeletedServerFilePolicy(value);

@@ -411,7 +411,7 @@ export class SyncHttpApi {
   async tombstones(input: {
     path?: string;
     fileId?: string;
-  } = {}): Promise<TombstoneRecord[]> {
+  } = {}): Promise<TombstoneRecord[] | undefined> {
     const settings = this.getSettings();
     const tombstones: TombstoneRecord[] = [];
     let cursor: number | undefined;
@@ -459,7 +459,7 @@ export class SyncHttpApi {
         cursor = result.nextCursor;
       }
     } catch (error) {
-      if (isUnsupportedEndpointError(error)) return [];
+      if (isUnsupportedEndpointError(error)) return undefined;
       throw error;
     }
 
@@ -774,6 +774,7 @@ export class SyncHttpApi {
         expectedHash: undefined,
         expectedCurrentHash: input.expectedCurrentHash,
         expectedCurrentSeq: input.expectedCurrentSeq,
+        deviceId: settings.deviceId,
       });
     });
 
@@ -833,6 +834,7 @@ export class SyncHttpApi {
           mtimeMs: input.mtimeMs,
           expectedCurrentHash: input.expectedCurrentHash,
           expectedCurrentSeq: input.expectedCurrentSeq,
+          deviceId: settings.deviceId,
           chunkSize: response.chunkSize,
           updatedAt: Date.now(),
         };
@@ -1203,12 +1205,12 @@ export class SyncHttpApi {
       deviceId?: string;
     },
   ): existing is PendingUploadState {
-    const settings = this.getSettings();
     return Boolean(
       existing &&
-      (existing.backend ?? "standalone") === settings.syncBackend &&
-      existing.vaultId === settings.vaultId &&
-      (existing.deviceId ?? settings.deviceId) === input.deviceId &&
+      (existing.backend ?? "standalone") === this.getSettings().syncBackend &&
+      existing.vaultId === this.getSettings().vaultId &&
+      Boolean(existing.deviceId) &&
+      existing.deviceId === input.deviceId &&
       existing.path === input.path &&
       existing.fileId === input.fileId &&
       existing.kind === input.kind &&

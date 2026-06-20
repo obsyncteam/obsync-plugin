@@ -1,4 +1,4 @@
-export const OBSYNC_PLUGIN_VERSION = "1.6.20";
+export const OBSYNC_PLUGIN_VERSION = "1.6.20.3";
 export const OBSYNC_PROTOCOL_VERSION = 1;
 export const OBSYNC_MIN_SERVER_PROTOCOL_VERSION = 1;
 
