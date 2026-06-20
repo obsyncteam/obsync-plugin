@@ -19,12 +19,14 @@ import { EchoSuppression } from "./sync/echo-suppression";
 import { VaultEventBridge } from "./sync/fs-events";
 import {
   SyncHttpApi,
+  type ClientSyncEventInput,
   type CreateShareResponse,
   type HistoryEntry,
   type ManifestFile,
   type PublishedShare,
   type StorageUsage,
   type SyncTransferProgress,
+  type TombstoneRecord,
   type UploadedFile,
 } from "./sync/http-api";
 import { isHostedSync } from "./sync/hosted-auth";
@@ -45,6 +47,15 @@ interface UploadStats {
   uploaded: number;
   skipped: number;
   skippedFiles: SkippedFileState[];
+}
+
+interface UploadPreconditions {
+  expectedCurrentHash?: string;
+  expectedCurrentSeq?: number;
+}
+
+interface UploadOptions {
+  preconditionsByPath?: Map<string, UploadPreconditions>;
 }
 
 interface ManualUploadProgress {
@@ -309,9 +320,17 @@ export default class ObsyncPlugin extends Plugin {
 
     await this.ensureManualSyncReady();
     const { api, bridge } = this.manualSyncContext();
+    const syncSessionId = `sync_${createRandomId(12)}`;
+    const syncStartedAt = Date.now();
 
     this.syncJobRunning = true;
     try {
+      this.reportClientSyncEvent(api, {
+        eventType: "sync_started",
+        severity: "info",
+        syncSessionId,
+        phase: "manual_sync",
+      });
       await api.ensureVault();
       const hostedStatus = isHostedSync(this.settings)
         ? await api.vaultSyncStatus()
@@ -321,6 +340,15 @@ export default class ObsyncPlugin extends Plugin {
       const serverByPath = new Map(serverFiles.map((file) => [file.path, file]));
       const localFiles = this.syncableLocalFiles(bridge);
       const localByPath = new Map(localFiles.map((file) => [file.path, file]));
+      const syncFilePaths = new Set([
+        ...serverByPath.keys(),
+        ...localByPath.keys(),
+      ]);
+      const totalSyncBytes = Array.from(syncFilePaths).reduce((sum, path) => {
+        const localBytes = localByPath.get(path)?.stat.size ?? 0;
+        const serverBytes = serverByPath.get(path)?.sizeBytes ?? 0;
+        return sum + Math.max(localBytes, serverBytes);
+      }, 0);
       if (
         hostedStatus &&
         hostedStatus.status !== "ready" &&
@@ -334,6 +362,19 @@ export default class ObsyncPlugin extends Plugin {
           t("progress_hosted_wait", { filesText }),
         );
         this.notice("notice_hosted_wait", undefined, 12000);
+        this.reportClientSyncEvent(api, {
+          eventType: "sync_failed",
+          severity: "warning",
+          syncSessionId,
+          phase: "manual_sync",
+          durationMs: Date.now() - syncStartedAt,
+          errorCode: "sync_error",
+          errorMessage: "sync_error",
+          filesTotal: syncFilePaths.size,
+          filesDone: 0,
+          bytesTotal: totalSyncBytes,
+          bytesDone: 0,
+        });
         return;
       }
       const downloadStats: DownloadStats = {
@@ -343,10 +384,23 @@ export default class ObsyncPlugin extends Plugin {
         conflicts: 0,
       };
       const uploadQueue = new Map<string, TFile>();
+      const uploadPreconditionsByPath = new Map<string, UploadPreconditions>();
+      const preUploadSkippedFiles: SkippedFileState[] = [];
       const totalServerBytes = serverFiles.reduce(
         (sum, file) => sum + (file.sizeBytes ?? 0),
         0,
       );
+      const manifestByPath = new Map(
+        manifest
+          .filter((file) => file.kind !== "folder")
+          .map((file) => [file.path, file]),
+      );
+      const localFilesMissingOnServer = localFiles.filter((file) => !serverByPath.has(file.path));
+      const tombstones = localFilesMissingOnServer.length > 0
+        ? await api.tombstones()
+        : [];
+      const tombstonesByPath = new Map(tombstones.map((tombstone) => [tombstone.path, tombstone]));
+      const tombstonesByFileId = new Map(tombstones.map((tombstone) => [tombstone.fileId, tombstone]));
       let processedServerBytes = 0;
 
       for (let index = 0; index < serverFiles.length; index += 1) {
@@ -411,7 +465,40 @@ export default class ObsyncPlugin extends Plugin {
 
       for (const localFile of localFiles) {
         if (!serverByPath.has(localFile.path)) {
+          const manifestFile = manifestByPath.get(localFile.path);
+          if (manifestFile?.deletedAt) {
+            if (this.settings.deletedServerFilePolicy === "server_wins") {
+              preUploadSkippedFiles.push(this.skippedFile(localFile, "server-deleted"));
+              continue;
+            }
+            if (this.settings.deletedServerFilePolicy === "conflict_copy") {
+              const conflictFile = await this.renameToConflictCopy(localFile);
+              uploadQueue.set(conflictFile.path, conflictFile);
+              uploadPreconditionsByPath.set(conflictFile.path, {});
+              continue;
+            }
+          }
+
+          const tombstone = this.tombstoneForLocalFile(
+            localFile,
+            tombstonesByPath,
+            tombstonesByFileId,
+          );
+          if (
+            tombstone &&
+            await this.handleServerDeletedLocalFile(
+              localFile,
+              tombstone,
+              uploadQueue,
+              uploadPreconditionsByPath,
+              preUploadSkippedFiles,
+            )
+          ) {
+            continue;
+          }
+
           uploadQueue.set(localFile.path, localFile);
+          uploadPreconditionsByPath.set(localFile.path, {});
         }
       }
 
@@ -431,7 +518,16 @@ export default class ObsyncPlugin extends Plugin {
       const uploadStats = await this.uploadFiles(
         api,
         [...uploadQueue.values()],
+        { preconditionsByPath: uploadPreconditionsByPath },
       );
+      if (preUploadSkippedFiles.length > 0) {
+        uploadStats.skipped += preUploadSkippedFiles.length;
+        uploadStats.skippedFiles = [
+          ...preUploadSkippedFiles,
+          ...uploadStats.skippedFiles,
+        ];
+        this.settings.lastSkippedFiles = uploadStats.skippedFiles.slice(0, 50);
+      }
 
       if (initialHostedUpload) {
         const readyStatus = await api.completeInitialSync();
@@ -454,11 +550,31 @@ export default class ObsyncPlugin extends Plugin {
           suffix: this.skippedSuffix(uploadStats),
         }),
       );
+      this.reportClientSyncEvent(api, {
+        eventType: "sync_completed",
+        severity: "info",
+        syncSessionId,
+        phase: "manual_sync",
+        durationMs: Date.now() - syncStartedAt,
+        filesTotal: syncFilePaths.size,
+        filesDone: syncFilePaths.size,
+        bytesTotal: totalSyncBytes,
+        bytesDone: totalSyncBytes,
+      });
       this.notice("notice_sync_completed");
     } catch (error) {
       const message = this.errorMessage(error);
       this.setProgress(t("progress_error", { message }));
       this.notice("notice_sync_error", { message });
+      this.reportClientSyncEvent(api, {
+        eventType: "sync_failed",
+        severity: "error",
+        syncSessionId,
+        phase: "manual_sync",
+        durationMs: Date.now() - syncStartedAt,
+        errorCode: this.syncErrorCode(error),
+        errorMessage: this.safeSyncTelemetryMessage(error),
+      });
       console.error("[obsync] sync failed", error);
     } finally {
       this.syncJobRunning = false;
@@ -516,9 +632,58 @@ export default class ObsyncPlugin extends Plugin {
     });
   }
 
+  private tombstoneForLocalFile(
+    file: TFile,
+    tombstonesByPath: Map<string, TombstoneRecord>,
+    tombstonesByFileId: Map<string, TombstoneRecord>,
+  ): TombstoneRecord | undefined {
+    const knownFileId = this.settings.fileIds[file.path];
+    if (knownFileId) {
+      const byFileId = tombstonesByFileId.get(knownFileId);
+      if (byFileId) return byFileId;
+    }
+    return tombstonesByPath.get(file.path);
+  }
+
+  private async handleServerDeletedLocalFile(
+    file: TFile,
+    tombstone: TombstoneRecord,
+    uploadQueue: Map<string, TFile>,
+    uploadPreconditionsByPath: Map<string, UploadPreconditions>,
+    skippedFiles: SkippedFileState[],
+  ): Promise<boolean> {
+    if (this.settings.deletedServerFilePolicy === "local_wins") return false;
+
+    const knownFileId = this.settings.fileIds[file.path];
+    const lastHash = this.settings.lastFileHashes[file.path];
+    const lastSeq = this.settings.lastFileSeqs[file.path];
+    const matchesKnownFile = Boolean(knownFileId && knownFileId === tombstone.fileId);
+    if (!lastHash && !matchesKnownFile) return false;
+    if (
+      tombstone.deletedSeq !== undefined &&
+      lastSeq !== undefined &&
+      tombstone.deletedSeq < lastSeq
+    ) {
+      return false;
+    }
+
+    const localHash = await this.localFileHash(file);
+    if (lastHash && localHash === lastHash) {
+      await this.deleteLocalFileFromServerDeletion(file);
+      skippedFiles.push(this.skippedFile(file, "server-deleted"));
+      return true;
+    }
+
+    const conflictFile = await this.renameToConflictCopy(file);
+    uploadQueue.set(conflictFile.path, conflictFile);
+    uploadPreconditionsByPath.set(conflictFile.path, {});
+    return true;
+  }
+
   private async uploadFiles(
     api: SyncHttpApi,
     files: TFile[],
+    options: UploadOptions = {},
   ): Promise<UploadStats> {
     const maxBytes = this.settings.maxAttachmentMB * 1024 * 1024;
     const totalBytes = files.reduce((sum, file) => sum + file.stat.size, 0);
@@ -572,8 +737,7 @@ export default class ObsyncPlugin extends Plugin {
       }
 
       const fileId = this.fileIdForPath(file.path);
-      const expectedCurrentHash = this.settings.lastFileHashes[file.path];
-      const expectedCurrentSeq = this.settings.lastFileSeqs[file.path];
+      const preconditions = this.uploadPreconditions(file, options);
       const body = await this.readFileBody(file, kind);
       const result = await api.uploadFile({
         fileId,
@@ -582,8 +746,8 @@ export default class ObsyncPlugin extends Plugin {
         body,
         mtimeMs: file.stat.mtime,
         contentType: this.contentTypeForKind(kind),
-        expectedCurrentHash,
-        expectedCurrentSeq,
+        expectedCurrentHash: preconditions.expectedCurrentHash,
+        expectedCurrentSeq: preconditions.expectedCurrentSeq,
       });
 
       this.settings.lastFileHashes[file.path] = result.hash;
@@ -621,14 +785,7 @@ export default class ObsyncPlugin extends Plugin {
       uploadProgress.preparingTo = toIndex;
       this.setProgress(this.formatUploadProgress());
       await api.prepareHostedUploads(windowFiles.map((file) => ({
-        fileId: this.fileIdForPath(file.path),
-        path: file.path,
-        kind: this.kindForFile(file),
-        sizeBytes: file.stat.size,
-        mtimeMs: file.stat.mtime,
-        contentType: this.contentTypeForKind(this.kindForFile(file)),
-        expectedCurrentHash: this.settings.lastFileHashes[file.path],
-        expectedCurrentSeq: this.settings.lastFileSeqs[file.path],
+        ...this.hostedUploadPrepareInput(file, options),
       })));
       uploadProgress.preparingFrom = undefined;
       uploadProgress.preparingTo = undefined;
@@ -673,7 +830,78 @@ export default class ObsyncPlugin extends Plugin {
   private uploadConcurrency(files: TFile[]): number {
     if (files.length < 2) return 1;
     if (this.settings.syncBackend !== "hosted") return 1;
+    if (this.clientRuntimeFields().isMobile) return 1;
     return Math.min(4, files.length);
+  }
+
+  private uploadPreconditions(file: TFile, options: UploadOptions): UploadPreconditions {
+    const override = options.preconditionsByPath?.get(file.path);
+    if (override) return override;
+    return {
+      expectedCurrentHash: this.settings.lastFileHashes[file.path],
+      expectedCurrentSeq: this.settings.lastFileSeqs[file.path],
+    };
+  }
+
+  private hostedUploadPrepareInput(file: TFile, options: UploadOptions) {
+    const kind = this.kindForFile(file);
+    const preconditions = this.uploadPreconditions(file, options);
+    return {
+      fileId: this.fileIdForPath(file.path),
+      path: file.path,
+      kind,
+      sizeBytes: file.stat.size,
+      mtimeMs: file.stat.mtime,
+      contentType: this.contentTypeForKind(kind),
+      expectedCurrentHash: preconditions.expectedCurrentHash,
+      expectedCurrentSeq: preconditions.expectedCurrentSeq,
+    };
+  }
+
+  private async renameToConflictCopy(file: TFile): Promise<TFile> {
+    const originalPath = file.path;
+    const conflictPath = this.uniqueConflictCopyPath(originalPath);
+    this.echoSuppression.suppress(originalPath);
+    this.echoSuppression.suppress(conflictPath);
+    await this.app.vault.rename(file, conflictPath);
+    delete this.settings.lastFileHashes[originalPath];
+    delete this.settings.lastFileSeqs[originalPath];
+    delete this.settings.fileIds[originalPath];
+    const renamed = this.app.vault.getAbstractFileByPath(conflictPath);
+    if (!(renamed instanceof TFile)) {
+      throw new Error(t("error_file_not_found"));
+    }
+    return renamed;
+  }
+
+  private async deleteLocalFileFromServerDeletion(file: TFile): Promise<void> {
+    const originalPath = file.path;
+    this.echoSuppression.suppress(originalPath);
+    await this.app.vault.delete(file, true);
+    delete this.settings.lastFileHashes[originalPath];
+    delete this.settings.lastFileSeqs[originalPath];
+    delete this.settings.fileIds[originalPath];
+  }
+
+  private uniqueConflictCopyPath(path: string): string {
+    const slashIndex = path.lastIndexOf("/");
+    const folder = slashIndex >= 0 ? `${path.slice(0, slashIndex)}/` : "";
+    const fileName = slashIndex >= 0 ? path.slice(slashIndex + 1) : path;
+    const dotIndex = fileName.lastIndexOf(".");
+    const baseName = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+    const extension = dotIndex > 0 ? fileName.slice(dotIndex) : "";
+    const device = this.settings.deviceLabel.replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "") || "device";
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/\D/g, "")
+      .slice(0, 14);
+
+    for (let index = 0; index < 100; index += 1) {
+      const suffix = index === 0 ? "" : `-${index + 1}`;
+      const candidate = `${folder}${baseName}.obsync-conflict-${device}-${timestamp}${suffix}${extension}`;
+      if (!this.app.vault.getAbstractFileByPath(candidate)) return candidate;
+    }
+    return `${folder}${baseName}.obsync-conflict-${device}-${timestamp}-${createRandomId(6)}${extension}`;
   }
 
   private registerFileMenu(): void {
@@ -1151,11 +1379,13 @@ export default class ObsyncPlugin extends Plugin {
         .map((file) => [file.path, file]),
     );
     const changedFiles: TFile[] = [];
+    const uploadPreconditionsByPath = new Map<string, UploadPreconditions>();
 
     for (const file of files) {
       const serverFile = serverByPath.get(file.path);
       if (!serverFile?.hash) {
         changedFiles.push(file);
+        uploadPreconditionsByPath.set(file.path, {});
         continue;
       }
 
@@ -1173,7 +1403,7 @@ export default class ObsyncPlugin extends Plugin {
     }
 
     try {
-      return await this.uploadFiles(api, changedFiles);
+      return await this.uploadFiles(api, changedFiles, { preconditionsByPath: uploadPreconditionsByPath });
     } catch (error) {
       throw new Error(
         t("notice_upload_before_publish_error", {
@@ -1892,6 +2122,54 @@ export default class ObsyncPlugin extends Plugin {
     return tailMinutes > 0
       ? t("duration_hours_minutes", { hours, minutes: tailMinutes })
       : t("duration_hours", { hours });
+  }
+
+  private reportClientSyncEvent(
+    api: SyncHttpApi | undefined,
+    input: ClientSyncEventInput,
+  ): void {
+    if (!api) return;
+    const runtime = this.clientRuntimeFields();
+    void api.reportClientSyncEvent({
+      ...runtime,
+      ...input,
+    }).catch((error) => {
+      console.warn("[obsync] client sync event report failed", this.errorMessage(error));
+    });
+  }
+
+  private clientRuntimeFields(): Pick<ClientSyncEventInput, "platform" | "isMobile"> {
+    const userAgent = typeof navigator === "undefined"
+      ? ""
+      : navigator.userAgent.toLowerCase();
+    if (!userAgent) return {};
+    if (userAgent.includes("android")) return { platform: "android", isMobile: true };
+    if (userAgent.includes("iphone") || userAgent.includes("ipad") || userAgent.includes("ios")) {
+      return { platform: "ios", isMobile: true };
+    }
+    if (userAgent.includes("windows")) return { platform: "windows", isMobile: false };
+    if (userAgent.includes("mac os")) return { platform: "macos", isMobile: false };
+    if (userAgent.includes("linux")) return { platform: "linux", isMobile: false };
+    return {};
+  }
+
+  private syncErrorCode(error: unknown): string {
+    const message = this.errorMessage(error).toLowerCase();
+    if (message.includes("failed to fetch")) return "failed_to_fetch";
+    const status = /\((\d{3})\)/.exec(message);
+    if (status) return `http_${status[1]}`;
+    if (message.includes("timeout") || message.includes("таймаут")) return "timeout";
+    if (message.includes("network") || message.includes("connection")) return "network";
+    return "sync_error";
+  }
+
+  private safeSyncTelemetryMessage(error: unknown): string {
+    const code = this.syncErrorCode(error);
+    if (code === "failed_to_fetch") return "failed_to_fetch";
+    if (code.startsWith("http_")) return code;
+    if (code === "timeout") return "timeout";
+    if (code === "network") return "network";
+    return "sync_error";
   }
 
   private errorMessage(error: unknown): string {

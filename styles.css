@@ -1,19 +1,5 @@
 .obsync-settings-intro {
-  margin-top: 18px;
-  margin-bottom: 14px;
-  padding-left: 16px;
-  max-width: 760px;
-}
-
-.obsync-settings-intro > p {
-  margin: 0;
-  font-size: var(--font-ui-small);
-  line-height: 1.45;
-  color: var(--text-muted);
-}
-
-.obsync-settings-section {
-  margin-top: 14px;
+  margin-bottom: 8px;
 }
 
 .obsync-progress-description {

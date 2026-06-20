@@ -22,6 +22,10 @@ const TRANSFER_REQUEST_TIMEOUT_MS = 120_000;
 const RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 20_000, 40_000, 60_000, 60_000];
 const HOSTED_UPLOAD_PREPARE_BATCH_SIZE = 32;
 const HOSTED_UPLOAD_PREPARE_BODY_MAX_BYTES = 24 * 1024;
+const HOSTED_MANIFEST_PAGE_LIMIT = 500;
+const TOMBSTONE_PAGE_LIMIT = 1000;
+const RETRY_JITTER_RATIO = 0.2;
+const MAX_RETRY_AFTER_MS = 120_000;
 
 export interface SyncTransferProgress {
   phase: "hashing" | "upload" | "download" | "finalize" | "retry";
@@ -57,6 +61,16 @@ export interface ManifestFile {
   storageKey?: string;
   storageKind?: string;
   contentType?: string;
+}
+
+export interface TombstoneRecord {
+  vaultId: string;
+  fileId: string;
+  path: string;
+  opId: string;
+  deviceId: string;
+  deletedSeq?: number;
+  deletedAt: string;
 }
 
 export interface DownloadedFile {
@@ -120,6 +134,23 @@ export interface VaultSyncStatus {
   startedAt?: string;
   completedAt?: string;
   updatedAt: string;
+}
+
+export interface ClientSyncEventInput {
+  eventType: "sync_started" | "sync_completed" | "sync_failed";
+  severity?: "info" | "warning" | "error";
+  syncSessionId?: string;
+  phase?: string;
+  httpStatus?: number;
+  errorCode?: string;
+  errorMessage?: string;
+  durationMs?: number;
+  filesTotal?: number;
+  filesDone?: number;
+  bytesTotal?: number;
+  bytesDone?: number;
+  platform?: string;
+  isMobile?: boolean;
 }
 
 export interface HistoryEntry {
@@ -271,6 +302,34 @@ export class SyncHttpApi {
     return this.requestJson<CompatibilityResponse>(this.pathFromUrl(url));
   }
 
+  async reportClientSyncEvent(input: ClientSyncEventInput): Promise<void> {
+    const settings = this.getSettings();
+    if (!isHostedSync(settings)) return;
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5_000);
+    try {
+      await fetch(hostedWebControlUrl(settings.serverUrl, "client-events"), {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          authorization: `Bearer ${settings.authToken}`,
+          "content-type": "application/json",
+          "x-obsync-client-version": OBSYNC_PLUGIN_VERSION,
+          "x-obsync-protocol-version": String(OBSYNC_PROTOCOL_VERSION),
+        },
+        body: JSON.stringify({
+          ...input,
+          deviceId: safeTelemetryDeviceId(settings.deviceId),
+          pluginVersion: OBSYNC_PLUGIN_VERSION,
+        }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   async ensureVault(): Promise<void> {
     const settings = this.getSettings();
     if (isHostedSync(settings)) {
@@ -290,16 +349,34 @@ export class SyncHttpApi {
   async manifest(): Promise<ManifestFile[]> {
     const settings = this.getSettings();
     if (isHostedSync(settings)) {
-      const ticket = await this.hostedTicket();
-      const result = await this.requestJson<{
-        manifest: ManifestFile[];
-        nextCursor?: string;
-        hasMore?: boolean;
-      }>(`/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/manifest`, {
-        method: "POST",
-        body: JSON.stringify({ ticket: ticket.rawTicket }),
-      }, false);
-      return result.manifest;
+      const manifest: ManifestFile[] = [];
+      let cursor = "";
+
+      while (true) {
+        const result = await this.requestHostedJson<{
+          manifest: ManifestFile[];
+          nextCursor?: string;
+          hasMore?: boolean;
+        }>((ticket) => ({
+          path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/manifest`,
+          body: {
+            ticket: ticket.rawTicket,
+            limit: HOSTED_MANIFEST_PAGE_LIMIT,
+            cursor: cursor || undefined,
+          },
+          label: "hosted manifest",
+        }));
+
+        manifest.push(...result.manifest);
+
+        if (!result.hasMore || !result.nextCursor || result.nextCursor === cursor) {
+          break;
+        }
+
+        cursor = result.nextCursor;
+      }
+
+      return manifest;
     }
 
     const manifest: ManifestFile[] = [];
@@ -331,18 +408,72 @@ export class SyncHttpApi {
     return manifest;
   }
 
+  async tombstones(input: {
+    path?: string;
+    fileId?: string;
+  } = {}): Promise<TombstoneRecord[]> {
+    const settings = this.getSettings();
+    const tombstones: TombstoneRecord[] = [];
+    let cursor: number | undefined;
+
+    try {
+      while (true) {
+        if (isHostedSync(settings)) {
+          const result = await this.requestHostedJson<{
+            tombstones: TombstoneRecord[];
+            nextCursor?: number;
+            hasMore?: boolean;
+          }>((ticket) => ({
+            path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/tombstones`,
+            body: {
+              ticket: ticket.rawTicket,
+              cursor,
+              limit: TOMBSTONE_PAGE_LIMIT,
+              path: input.path,
+              fileId: input.fileId,
+            },
+            label: "hosted tombstones",
+          }));
+
+          tombstones.push(...result.tombstones);
+          if (!result.hasMore || !result.nextCursor || result.nextCursor === cursor) break;
+          cursor = result.nextCursor;
+          continue;
+        }
+
+        const url = new URL(`${settings.serverUrl}/api/v1/tombstones`);
+        url.searchParams.set("vaultId", settings.vaultId);
+        url.searchParams.set("limit", String(TOMBSTONE_PAGE_LIMIT));
+        if (cursor !== undefined) url.searchParams.set("cursor", String(cursor));
+        if (input.path) url.searchParams.set("path", input.path);
+        if (input.fileId) url.searchParams.set("fileId", input.fileId);
+
+        const result = await this.requestJson<{
+          tombstones: TombstoneRecord[];
+          nextCursor?: number;
+          hasMore?: boolean;
+        }>(this.pathFromUrl(url));
+
+        tombstones.push(...result.tombstones);
+        if (!result.hasMore || !result.nextCursor || result.nextCursor === cursor) break;
+        cursor = result.nextCursor;
+      }
+    } catch (error) {
+      if (isUnsupportedEndpointError(error)) return [];
+      throw error;
+    }
+
+    return tombstones;
+  }
+
   async storageUsage(): Promise<StorageUsage> {
     const settings = this.getSettings();
     if (isHostedSync(settings)) {
-      const ticket = await this.hostedTicket();
-      const result = await this.requestJson<{ usage: StorageUsage }>(
-        `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/storage/usage`,
-        {
-          method: "POST",
-          body: JSON.stringify({ ticket: ticket.rawTicket }),
-        },
-        false,
-      );
+      const result = await this.requestHostedJson<{ usage: StorageUsage }>((ticket) => ({
+        path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/storage/usage`,
+        body: { ticket: ticket.rawTicket },
+        label: "hosted storage usage",
+      }));
       return result.usage;
     }
 
@@ -356,15 +487,11 @@ export class SyncHttpApi {
   async vaultSyncStatus(): Promise<VaultSyncStatus> {
     const settings = this.getSettings();
     if (isHostedSync(settings)) {
-      const ticket = await this.hostedTicket();
-      const result = await this.requestJson<{ status: VaultSyncStatus }>(
-        `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/status`,
-        {
-          method: "POST",
-          body: JSON.stringify({ ticket: ticket.rawTicket }),
-        },
-        false,
-      );
+      const result = await this.requestHostedJson<{ status: VaultSyncStatus }>((ticket) => ({
+        path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/status`,
+        body: { ticket: ticket.rawTicket },
+        label: "hosted status",
+      }));
       return result.status;
     }
 
@@ -382,19 +509,15 @@ export class SyncHttpApi {
   async beginInitialSync(input: { totalFiles?: number; totalBytes?: number }): Promise<VaultSyncStatus> {
     const settings = this.getSettings();
     if (isHostedSync(settings)) {
-      const ticket = await this.hostedTicket();
-      const result = await this.requestJson<{ status: VaultSyncStatus }>(
-        `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/initial-sync/begin`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            ticket: ticket.rawTicket,
-            totalFiles: input.totalFiles,
-            totalBytes: input.totalBytes,
-          }),
+      const result = await this.requestHostedJson<{ status: VaultSyncStatus }>((ticket) => ({
+        path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/initial-sync/begin`,
+        body: {
+          ticket: ticket.rawTicket,
+          totalFiles: input.totalFiles,
+          totalBytes: input.totalBytes,
         },
-        false,
-      );
+        label: "hosted initial sync begin",
+      }));
       return result.status;
     }
     return this.vaultSyncStatus();
@@ -403,15 +526,11 @@ export class SyncHttpApi {
   async completeInitialSync(): Promise<VaultSyncStatus> {
     const settings = this.getSettings();
     if (isHostedSync(settings)) {
-      const ticket = await this.hostedTicket();
-      const result = await this.requestJson<{ status: VaultSyncStatus }>(
-        `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/initial-sync/complete`,
-        {
-          method: "POST",
-          body: JSON.stringify({ ticket: ticket.rawTicket }),
-        },
-        false,
-      );
+      const result = await this.requestHostedJson<{ status: VaultSyncStatus }>((ticket) => ({
+        path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/initial-sync/complete`,
+        body: { ticket: ticket.rawTicket },
+        label: "hosted initial sync complete",
+      }));
       return result.status;
     }
     return this.vaultSyncStatus();
@@ -421,19 +540,15 @@ export class SyncHttpApi {
     const validPath = this.validPath(path);
     const settings = this.getSettings();
     if (isHostedSync(settings)) {
-      const ticket = await this.hostedTicket();
-      const result = await this.requestJson<HistoryPage & { ok: true }>(
-        `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/history`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            ticket: ticket.rawTicket,
-            path: validPath,
-            limit,
-          }),
+      const result = await this.requestHostedJson<HistoryPage & { ok: true }>((ticket) => ({
+        path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/history`,
+        body: {
+          ticket: ticket.rawTicket,
+          path: validPath,
+          limit,
         },
-        false,
-      );
+        label: `hosted history ${validPath}`,
+      }));
       return result;
     }
 
@@ -449,19 +564,15 @@ export class SyncHttpApi {
     const validPath = this.validPath(path);
     const settings = this.getSettings();
     if (isHostedSync(settings)) {
-      const ticket = await this.hostedTicket();
-      const result = await this.requestJson<{ version: HistoryVersion }>(
-        `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/history/content`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            ticket: ticket.rawTicket,
-            path: validPath,
-            serverSeq,
-          }),
+      const result = await this.requestHostedJson<{ version: HistoryVersion }>((ticket) => ({
+        path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/history/content`,
+        body: {
+          ticket: ticket.rawTicket,
+          path: validPath,
+          serverSeq,
         },
-        false,
-      );
+        label: `hosted history content ${validPath}`,
+      }));
       return result.version;
     }
 
@@ -668,7 +779,6 @@ export class SyncHttpApi {
 
     let offset = 0;
     while (offset < pendingInputs.length) {
-      const ticket = await this.hostedTicket();
       const batch: HostedUploadPrepareInput[] = [];
       const filesPayload: Array<Record<string, unknown>> = [];
 
@@ -677,7 +787,7 @@ export class SyncHttpApi {
         const filePayload = this.hostedUploadBatchFile(input);
         const nextFiles = [...filesPayload, filePayload];
         const bodyBytes = jsonBodyBytes({
-          ticket: ticket.rawTicket,
+          ticket: "",
           files: nextFiles,
         });
 
@@ -693,17 +803,14 @@ export class SyncHttpApi {
         offset += 1;
       }
 
-      const result = await this.requestJson<HostedUploadBatchResponse>(
-        `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/uploads/batch`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            ticket: ticket.rawTicket,
-            files: filesPayload,
-          }),
+      const result = await this.requestHostedJson<HostedUploadBatchResponse>((ticket) => ({
+        path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/uploads/batch`,
+        body: {
+          ticket: ticket.rawTicket,
+          files: filesPayload,
         },
-        false,
-      );
+        label: "hosted upload batch",
+      }));
       if (result.uploads.length !== batch.length) {
         throw new Error("сервер вернул неполный список сессий синхронизации");
       }
@@ -939,6 +1046,75 @@ export class SyncHttpApi {
     return (await response.json()) as T;
   }
 
+  private async requestHostedJson<T = unknown>(
+    buildRequest: (ticket: HostedSyncTicket) => {
+      path: string;
+      body: unknown;
+      label: string;
+    },
+  ): Promise<T> {
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
+      const ticket = await this.hostedTicket();
+      const request = buildRequest(ticket);
+      const requestUrl = `${hostedSyncApiBaseUrl(ticket.sync.syncBaseUrl)}${request.path}`;
+
+      let response: Response;
+      try {
+        response = await this.fetchOnce(
+          requestUrl,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-obsync-client-version": OBSYNC_PLUGIN_VERSION,
+              "x-obsync-protocol-version": String(OBSYNC_PROTOCOL_VERSION),
+            },
+            body: JSON.stringify(request.body),
+          },
+          JSON_REQUEST_TIMEOUT_MS,
+        );
+      } catch (error) {
+        lastError = error;
+        if (!isRetryableFetchError(error) || attempt >= RETRY_DELAYS_MS.length) {
+          break;
+        }
+        await this.waitBeforeRetry({ label: request.label }, attempt, readableFetchError(error));
+        continue;
+      }
+
+      if (response.ok) {
+        return (await response.json()) as T;
+      }
+
+      const bodyText = response.status === 401 || !isRetryableStatus(response.status)
+        ? await response.text()
+        : undefined;
+      const ticketExpired = response.status === 401 && isHostedTicketError(bodyText ?? "");
+      const retryAllowed = attempt < RETRY_DELAYS_MS.length &&
+        (isRetryableStatus(response.status) || (ticketExpired && attempt === 0));
+
+      if (retryAllowed) {
+        await this.waitBeforeRetry(
+          { label: request.label },
+          attempt,
+          ticketExpired ? "сервер отклонил одноразовый билет" : `сервер ответил ${response.status}`,
+          ticketExpired ? undefined : retryAfterMs(response.headers),
+        );
+        continue;
+      }
+
+      throw new Error(
+        `запрос не выполнен (${response.status}): ${bodyText ?? await response.text()}`,
+      );
+    }
+
+    throw new Error(
+      `соединение оборвалось после ${RETRY_DELAYS_MS.length + 1} попыток: ${readableFetchError(lastError)}`,
+    );
+  }
+
   private pathFromUrl(url: URL): string {
     return `${url.pathname}${url.search}`;
   }
@@ -968,6 +1144,7 @@ export class SyncHttpApi {
       expectedHash: input.expectedHash,
       expectedCurrentHash: input.expectedCurrentHash,
       expectedCurrentSeq: input.expectedCurrentSeq,
+      deviceId: settings.deviceId,
     })) {
       try {
         await this.uploadStatus(existing.uploadId, existing);
@@ -1003,6 +1180,7 @@ export class SyncHttpApi {
       expectedHash: input.expectedHash,
       expectedCurrentHash: input.expectedCurrentHash,
       expectedCurrentSeq: input.expectedCurrentSeq,
+      deviceId: settings.deviceId,
       chunkSize: session.chunkSize,
       updatedAt: Date.now(),
     };
@@ -1022,6 +1200,7 @@ export class SyncHttpApi {
       expectedHash?: string;
       expectedCurrentHash?: string;
       expectedCurrentSeq?: number;
+      deviceId?: string;
     },
   ): existing is PendingUploadState {
     const settings = this.getSettings();
@@ -1029,6 +1208,7 @@ export class SyncHttpApi {
       existing &&
       (existing.backend ?? "standalone") === settings.syncBackend &&
       existing.vaultId === settings.vaultId &&
+      (existing.deviceId ?? settings.deviceId) === input.deviceId &&
       existing.path === input.path &&
       existing.fileId === input.fileId &&
       existing.kind === input.kind &&
@@ -1053,27 +1233,23 @@ export class SyncHttpApi {
   }): Promise<UploadSessionResponse> {
     const settings = this.getSettings();
     if (isHostedSync(settings)) {
-      const ticket = await this.hostedTicket();
-      const result = await this.requestJson<HostedUploadResponse>(
-        `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/uploads`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            ticket: ticket.rawTicket,
-            fileId: input.fileId,
-            path: input.path,
-            kind: input.kind,
-            sizeBytes: input.sizeBytes,
-            mtimeMs: input.mtimeMs,
-            contentType: input.contentType,
-            expectedHash: input.expectedHash,
-            expectedCurrentHash: input.expectedCurrentHash,
-            expectedCurrentSeq: input.expectedCurrentSeq,
-            chunkSizeBytes: DOWNLOAD_CHUNK_SIZE,
-          }),
+      const result = await this.requestHostedJson<HostedUploadResponse>((ticket) => ({
+        path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/uploads`,
+        body: {
+          ticket: ticket.rawTicket,
+          fileId: input.fileId,
+          path: input.path,
+          kind: input.kind,
+          sizeBytes: input.sizeBytes,
+          mtimeMs: input.mtimeMs,
+          contentType: input.contentType,
+          expectedHash: input.expectedHash,
+          expectedCurrentHash: input.expectedCurrentHash,
+          expectedCurrentSeq: input.expectedCurrentSeq,
+          chunkSizeBytes: DOWNLOAD_CHUNK_SIZE,
         },
-        false,
-      );
+        label: `hosted create upload ${input.path}`,
+      }));
       return this.hostedUploadResponse(result);
     }
 
@@ -1457,23 +1633,28 @@ export class SyncHttpApi {
   }
 
   private async createHostedDownload(path: string): Promise<HostedDownloadSession> {
-    const ticket = await this.hostedTicket();
-    const result = await this.requestJson<{
+    let activeTicket: HostedSyncTicket | undefined;
+    const result = await this.requestHostedJson<{
       download: {
         id: string;
         contentUrl: string;
       };
       transferToken: string;
-    }>(`/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/downloads`, {
-      method: "POST",
-      body: JSON.stringify({
-        ticket: ticket.rawTicket,
-        path,
-      }),
-    }, false);
+    }>((ticket) => {
+      activeTicket = ticket;
+      return {
+        path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/downloads`,
+        body: {
+          ticket: ticket.rawTicket,
+          path,
+        },
+        label: `hosted create download ${path}`,
+      };
+    });
+    if (!activeTicket) throw new Error("сервер не выдал данные tenant для скачивания");
 
     return {
-      tenantId: ticket.sync.tenantId,
+      tenantId: activeTicket.sync.tenantId,
       downloadId: result.download.id,
       contentUrl: result.download.contentUrl,
       transferToken: result.transferToken,
@@ -1507,23 +1688,20 @@ export class SyncHttpApi {
     let lastError: unknown;
 
     for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), context.timeoutMs);
       try {
-        const response = await fetch(input, {
-          ...init,
-          signal: controller.signal,
-        });
-        clearTimeout(timeout);
-
+        const response = await this.fetchOnce(input, init, context.timeoutMs);
         if (isRetryableStatus(response.status) && attempt < RETRY_DELAYS_MS.length) {
-          await this.waitBeforeRetry(context, attempt, `сервер ответил ${response.status}`);
+          await this.waitBeforeRetry(
+            context,
+            attempt,
+            `сервер ответил ${response.status}`,
+            retryAfterMs(response.headers),
+          );
           continue;
         }
 
         return response;
       } catch (error) {
-        clearTimeout(timeout);
         lastError = error;
         if (!isRetryableFetchError(error) || attempt >= RETRY_DELAYS_MS.length) {
           break;
@@ -1537,12 +1715,30 @@ export class SyncHttpApi {
     );
   }
 
+  private async fetchOnce(
+    input: RequestInfo | URL,
+    init: RequestInit = {},
+    timeoutMs: number,
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(input, {
+        ...init,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   private async waitBeforeRetry(
     context: { label: string },
     attempt: number,
     reason: string,
+    retryAfterDelayMs?: number,
   ): Promise<void> {
-    const delayMs = RETRY_DELAYS_MS[attempt] ?? RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1];
+    const delayMs = retryDelayMs(attempt, retryAfterDelayMs);
     this.onProgress({
       phase: "retry",
       path: context.label,
@@ -1567,6 +1763,33 @@ export class SyncHttpApi {
     });
     if (!validPath) throw new Error(`некорректный путь внутри хранилища: ${path}`);
     return validPath;
+  }
+}
+
+function safeTelemetryDeviceId(deviceId: string | undefined): string | undefined {
+  const trimmed = deviceId?.trim();
+  if (!trimmed || !/^device-[a-zA-Z0-9_.:-]{8,160}$/.test(trimmed)) return undefined;
+  return trimmed;
+}
+
+function hostedWebControlUrl(serverUrl: string, path: string): string {
+  const normalizedPath = path.replace(/^\/+/, "");
+  try {
+    const url = new URL(serverUrl);
+    if (
+      url.hostname === "obsync.ru" ||
+      url.hostname === "www.obsync.ru" ||
+      url.hostname === "sync.obsync.ru" ||
+      url.hostname === "api.obsync.ru"
+    ) {
+      return `https://obsync.ru/api/web/control/sync/${normalizedPath}`;
+    }
+    url.pathname = `/api/web/control/sync/${normalizedPath}`;
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return `${serverUrl.replace(/\/+$/, "")}/api/web/control/sync/${normalizedPath}`;
   }
 }
 
@@ -1598,6 +1821,37 @@ function isRetryableFetchError(error: unknown): boolean {
     message.includes("connection") ||
     message.includes("reset") ||
     message.includes("aborted");
+}
+
+function isHostedTicketError(body: string): boolean {
+  const normalized = body.toLowerCase();
+  return normalized.includes("ticket") ||
+    normalized.includes("билет");
+}
+
+function isUnsupportedEndpointError(error: unknown): boolean {
+  return error instanceof Error && /\(404\)/.test(error.message);
+}
+
+function retryAfterMs(headers: Headers): number | undefined {
+  const value = headers.get("retry-after");
+  if (!value) return undefined;
+
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(MAX_RETRY_AFTER_MS, Math.round(seconds * 1000));
+  }
+
+  const dateMs = Date.parse(value);
+  if (!Number.isFinite(dateMs)) return undefined;
+  return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, dateMs - Date.now()));
+}
+
+function retryDelayMs(attempt: number, retryAfterDelayMs?: number): number {
+  if (retryAfterDelayMs !== undefined) return retryAfterDelayMs;
+  const baseDelayMs = RETRY_DELAYS_MS[attempt] ?? RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1];
+  const jitterMs = Math.round(baseDelayMs * RETRY_JITTER_RATIO * Math.random());
+  return baseDelayMs + jitterMs;
 }
 
 function readableFetchError(error: unknown): string {

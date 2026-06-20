@@ -5,6 +5,7 @@ import { t } from "./i18n";
 
 export type SetupMode = "primary" | "secondary";
 export type SyncBackend = "standalone" | "hosted";
+export type DeletedServerFilePolicy = "local_wins" | "server_wins" | "conflict_copy";
 
 export interface PendingUploadState {
   uploadId: string;
@@ -20,6 +21,7 @@ export interface PendingUploadState {
   expectedHash?: string;
   expectedCurrentHash?: string;
   expectedCurrentSeq?: number;
+  deviceId?: string;
   chunkSize: number;
   updatedAt: number;
 }
@@ -27,7 +29,7 @@ export interface PendingUploadState {
 export interface SkippedFileState {
   path: string;
   sizeBytes: number;
-  reason: "large" | "attachments-disabled";
+  reason: "large" | "attachments-disabled" | "server-deleted";
   skippedAt: number;
 }
 
@@ -73,6 +75,7 @@ export interface ObsyncSettings {
   deviceName: string;
   syncAttachments: boolean;
   syncObsidianConfig: boolean;
+  deletedServerFilePolicy: DeletedServerFilePolicy;
   maxAttachmentMB: number;
   ignoredPatterns: string[];
   lastCursor: number;
@@ -105,6 +108,7 @@ export const DEFAULT_SETTINGS: ObsyncSettings = {
   deviceName: "",
   syncAttachments: true,
   syncObsidianConfig: false,
+  deletedServerFilePolicy: "server_wins",
   maxAttachmentMB: 100,
   ignoredPatterns: [".obsidian/", ".trash/", ".DS_Store"],
   lastCursor: 0,
@@ -137,6 +141,7 @@ export async function normalizeSettings(settings: ObsyncSettings): Promise<Obsyn
     pendingUploads: settings.pendingUploads ?? {},
     lastSkippedFiles: settings.lastSkippedFiles ?? [],
     syncObsidianConfig: false,
+    deletedServerFilePolicy: normalizeDeletedServerFilePolicy(settings.deletedServerFilePolicy),
     publishFolder: normalizePublishFolder(settings.publishFolder ?? ""),
     publishLinks: settings.publishLinks ?? {},
   });
@@ -153,9 +158,7 @@ export function recomputeDerivedIds(settings: ObsyncSettings): ObsyncSettings {
     ? settings.userId
     : deriveUserId(settings.authToken) || settings.userId || fallbackUserId();
   const deviceLabel = settings.deviceLabel || settings.deviceName || "device";
-  const deviceId = keepStandaloneIdentity
-    ? settings.deviceId
-    : buildScopedId(userId, deviceLabel) || settings.deviceId || createDeviceId();
+  const deviceId = validDeviceId(settings.deviceId) ? settings.deviceId : createDeviceId();
   const inferredVaultName = settings.vaultName || inferVaultName(settings.vaultId, userId);
   const hostedVaultId = settings.hostedVaultId ?? "";
   const vaultId = syncBackend === "hosted" && hostedVaultId
@@ -218,6 +221,10 @@ function fallbackUserId(): string {
   return `u${createDeviceId().replace(/^device-/, "").slice(0, 10)}`;
 }
 
+function validDeviceId(value: string | undefined): value is string {
+  return Boolean(value && /^device-[a-zA-Z0-9_.:-]{8,160}$/.test(value));
+}
+
 function slugify(value: string): string {
   return value
     .trim()
@@ -234,6 +241,11 @@ function normalizePublishFolder(value: string): string {
     .replace(/\\/g, "/")
     .replace(/\/+/g, "/")
     .replace(/\/+$/g, "");
+}
+
+function normalizeDeletedServerFilePolicy(value: unknown): DeletedServerFilePolicy {
+  if (value === "server_wins" || value === "conflict_copy") return value;
+  return "local_wins";
 }
 
 export class ObsyncSettingTab extends PluginSettingTab {
@@ -398,6 +410,21 @@ export class ObsyncSettingTab extends PluginSettingTab {
           this.plugin.settings.syncAttachments = value;
           await this.plugin.saveSettings();
         });
+      });
+
+    new Setting(connectionSection)
+      .setName(t("settings_deleted_file_policy"))
+      .setDesc(t("settings_deleted_file_policy_desc"))
+      .addDropdown((dropdown) => {
+        dropdown
+          .addOption("server_wins", t("settings_deleted_file_policy_server_wins"))
+          .addOption("conflict_copy", t("settings_deleted_file_policy_conflict_copy"))
+          .addOption("local_wins", t("settings_deleted_file_policy_local_wins"))
+          .setValue(this.plugin.settings.deletedServerFilePolicy)
+          .onChange(async (value) => {
+            this.plugin.settings.deletedServerFilePolicy = normalizeDeletedServerFilePolicy(value);
+            await this.plugin.saveSettings();
+          });
       });
 
     new Setting(connectionSection)

@@ -1,12 +1,12 @@
 {
   "name": "obsync",
-  "version": "1.6.9",
+  "version": "1.6.20",
   "description": "Obsidian plugin for obsync sync",
   "main": "main.js",
   "scripts": {
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs",
-    "pack": "npm run build && rm -rf dist/obsync && mkdir -p dist/obsync && cp main.js manifest.json styles.css dist/obsync/ && if command -v zip >/dev/null 2>&1; then (cd dist && zip -r ../obsync_v$npm_package_version.zip obsync); elif command -v bsdtar >/dev/null 2>&1; then bsdtar -a -cf obsync_v$npm_package_version.zip -C dist obsync; else echo 'zip or bsdtar is required' >&2; exit 1; fi",
+    "pack": "npm run build && rm -rf dist/obsync && mkdir -p dist/obsync && cp main.js manifest.json styles.css dist/obsync/ && if command -v zip >/dev/null 2>&1; then (cd dist && zip -r ../obsync_v$npm_package_version.zip obsync); elif command -v bsdtar >/dev/null 2>&1; then bsdtar -a -cf obsync_v$npm_package_version.zip -C dist obsync; elif command -v python3 >/dev/null 2>&1; then (cd dist && python3 -m zipfile -c ../obsync_v$npm_package_version.zip obsync); else echo 'zip, bsdtar or python3 is required' >&2; exit 1; fi",
     "typecheck": "tsc -noEmit -skipLibCheck"
   },
   "keywords": [
