@@ -19,7 +19,7 @@
 Скачайте архив релиза:
 
 ```text
-obsync_v1.6.9.zip
+obsync_v1.6.20.zip
 ```
 
 Распакуйте его в хранилище Obsidian:
@@ -72,7 +72,7 @@ npm run pack
 Имя архива:
 
 ```text
-obsync_v1.6.9.zip
+obsync_v1.6.20.zip
 ```
 
 Структура архива:

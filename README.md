@@ -21,7 +21,7 @@ The international website is in development.
 Download the release archive:
 
 ```text
-obsync_v1.6.9.zip
+obsync_v1.6.20.zip
 ```
 
 Unpack it into your Obsidian vault:
@@ -74,7 +74,7 @@ npm run pack
 The archive name is:
 
 ```text
-obsync_v1.6.9.zip
+obsync_v1.6.20.zip
 ```
 
 Archive structure:
