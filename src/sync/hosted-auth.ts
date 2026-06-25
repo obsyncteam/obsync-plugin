@@ -10,6 +10,12 @@ const TICKET_RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000];
 export interface HostedSyncTicket {
   ticket: string;
   rawTicket: string;
+  syncSessionToken?: string;
+  rawSyncSessionToken?: string;
+  syncSession?: {
+    id?: string;
+    expiresAt?: string;
+  };
   sync: {
     tenantId: string;
     vaultId: string;
@@ -70,8 +76,21 @@ export function hostedControlUrl(serverUrl: string, path: string): string {
   const normalizedPath = path.replace(/^\/+/, "");
   try {
     const url = new URL(serverUrl);
-    if (url.hostname === "obsync.ru" || url.hostname === "www.obsync.ru" || url.hostname === "sync.obsync.ru") {
+    if (
+      url.hostname === "obsync.ru" ||
+      url.hostname === "www.obsync.ru" ||
+      url.hostname === "sync.obsync.ru" ||
+      url.hostname === "api.obsync.ru"
+    ) {
       return `https://api.obsync.ru/api/control/v1/sync/${normalizedPath}`;
+    }
+    if (
+      url.hostname === "obsync.pro" ||
+      url.hostname === "www.obsync.pro" ||
+      url.hostname === "sync.obsync.pro" ||
+      url.hostname === "api.obsync.pro"
+    ) {
+      return `https://api.obsync.pro/api/control/v1/sync/${normalizedPath}`;
     }
     url.pathname = `/api/control/v1/sync/${normalizedPath}`;
     url.search = "";

@@ -274,7 +274,18 @@ interface HostedDownloadSession {
   transferToken: string;
 }
 
+interface HostedAuthContext extends HostedSyncTicket {
+  syncSessionToken?: string;
+  sessionUsableUntilMs?: number;
+}
+
+type HostedAuthMode = "session" | "legacy";
+
 export class SyncHttpApi {
+  private hostedSession?: HostedAuthContext;
+  private hostedSessionRefresh?: Promise<HostedAuthContext>;
+  private hostedLegacyModeUntilMs = 0;
+
   constructor(
     private readonly getSettings: () => ObsyncSettings,
     private readonly saveSettings: () => Promise<void> = async () => {},
@@ -333,7 +344,7 @@ export class SyncHttpApi {
   async ensureVault(): Promise<void> {
     const settings = this.getSettings();
     if (isHostedSync(settings)) {
-      await this.hostedTicket();
+      await this.hostedAuthContext();
       return;
     }
 
@@ -360,7 +371,6 @@ export class SyncHttpApi {
         }>((ticket) => ({
           path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/manifest`,
           body: {
-            ticket: ticket.rawTicket,
             limit: HOSTED_MANIFEST_PAGE_LIMIT,
             cursor: cursor || undefined,
           },
@@ -426,7 +436,6 @@ export class SyncHttpApi {
           }>((ticket) => ({
             path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/tombstones`,
             body: {
-              ticket: ticket.rawTicket,
               cursor,
               limit: TOMBSTONE_PAGE_LIMIT,
               path: input.path,
@@ -471,7 +480,7 @@ export class SyncHttpApi {
     if (isHostedSync(settings)) {
       const result = await this.requestHostedJson<{ usage: StorageUsage }>((ticket) => ({
         path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/storage/usage`,
-        body: { ticket: ticket.rawTicket },
+        body: {},
         label: "hosted storage usage",
       }));
       return result.usage;
@@ -489,7 +498,7 @@ export class SyncHttpApi {
     if (isHostedSync(settings)) {
       const result = await this.requestHostedJson<{ status: VaultSyncStatus }>((ticket) => ({
         path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/status`,
-        body: { ticket: ticket.rawTicket },
+        body: {},
         label: "hosted status",
       }));
       return result.status;
@@ -512,7 +521,6 @@ export class SyncHttpApi {
       const result = await this.requestHostedJson<{ status: VaultSyncStatus }>((ticket) => ({
         path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/initial-sync/begin`,
         body: {
-          ticket: ticket.rawTicket,
           totalFiles: input.totalFiles,
           totalBytes: input.totalBytes,
         },
@@ -528,7 +536,7 @@ export class SyncHttpApi {
     if (isHostedSync(settings)) {
       const result = await this.requestHostedJson<{ status: VaultSyncStatus }>((ticket) => ({
         path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/initial-sync/complete`,
-        body: { ticket: ticket.rawTicket },
+        body: {},
         label: "hosted initial sync complete",
       }));
       return result.status;
@@ -543,7 +551,6 @@ export class SyncHttpApi {
       const result = await this.requestHostedJson<HistoryPage & { ok: true }>((ticket) => ({
         path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/history`,
         body: {
-          ticket: ticket.rawTicket,
           path: validPath,
           limit,
         },
@@ -567,7 +574,6 @@ export class SyncHttpApi {
       const result = await this.requestHostedJson<{ version: HistoryVersion }>((ticket) => ({
         path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/history/content`,
         body: {
-          ticket: ticket.rawTicket,
           path: validPath,
           serverSeq,
         },
@@ -669,7 +675,7 @@ export class SyncHttpApi {
       expectedHash = `sha256:${await sha256Hex(input.body)}`;
     }
     if (isHostedSync(settings) && !settings.hostedTenantId) {
-      await this.hostedTicket();
+      await this.hostedAuthContext();
     }
     if (!isHostedSync(settings) && input.body.byteLength <= DIRECT_UPLOAD_MAX_BYTES) {
       return this.uploadFileDirect({
@@ -758,7 +764,7 @@ export class SyncHttpApi {
     const settings = this.getSettings();
     if (!isHostedSync(settings) || inputs.length === 0) return;
     if (!settings.hostedTenantId) {
-      await this.hostedTicket();
+      await this.hostedAuthContext();
     }
 
     const pendingInputs = inputs.filter((input) => {
@@ -788,7 +794,7 @@ export class SyncHttpApi {
         const filePayload = this.hostedUploadBatchFile(input);
         const nextFiles = [...filesPayload, filePayload];
         const bodyBytes = jsonBodyBytes({
-          ticket: "",
+          syncSessionToken: "",
           files: nextFiles,
         });
 
@@ -807,7 +813,6 @@ export class SyncHttpApi {
       const result = await this.requestHostedJson<HostedUploadBatchResponse>((ticket) => ({
         path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/uploads/batch`,
         body: {
-          ticket: ticket.rawTicket,
           files: filesPayload,
         },
         label: "hosted upload batch",
@@ -943,6 +948,7 @@ export class SyncHttpApi {
   async downloadFileToAdapter(input: {
     path: string;
     expectedSizeBytes: number;
+    expectedHash?: string;
     adapter: DataAdapter;
     tempPath: string;
     targetPath: string;
@@ -994,6 +1000,9 @@ export class SyncHttpApi {
       const stat = await adapter.stat(input.tempPath);
       if (!stat || stat.size !== input.expectedSizeBytes) {
         throw new Error("размер скачанного файла не совпал с ожидаемым");
+      }
+      if (input.expectedHash && hash !== input.expectedHash) {
+        throw new Error(`скачанная версия файла не совпала с ожидаемой: ${validPath}`);
       }
 
       input.beforeCommit?.();
@@ -1049,18 +1058,27 @@ export class SyncHttpApi {
   }
 
   private async requestHostedJson<T = unknown>(
-    buildRequest: (ticket: HostedSyncTicket) => {
+    buildRequest: (auth: HostedAuthContext) => {
       path: string;
       body: unknown;
       label: string;
     },
   ): Promise<T> {
     let lastError: unknown;
+    let forceRefresh = false;
+    let retriedSessionRefresh = false;
+    let legacyRetryForCurrentRequest = false;
 
     for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
-      const ticket = await this.hostedTicket();
-      const request = buildRequest(ticket);
-      const requestUrl = `${hostedSyncApiBaseUrl(ticket.sync.syncBaseUrl)}${request.path}`;
+      const legacyMode = legacyRetryForCurrentRequest || Date.now() < this.hostedLegacyModeUntilMs;
+      const auth = await this.hostedAuthContext({
+        forceRefresh,
+        freshTicket: legacyMode,
+      });
+      forceRefresh = false;
+      const request = buildRequest(auth);
+      const requestUrl = `${hostedSyncApiBaseUrl(auth.sync.syncBaseUrl)}${request.path}`;
+      const authMode: HostedAuthMode = auth.syncSessionToken && !legacyMode ? "session" : "legacy";
 
       let response: Response;
       try {
@@ -1073,7 +1091,7 @@ export class SyncHttpApi {
               "x-obsync-client-version": OBSYNC_PLUGIN_VERSION,
               "x-obsync-protocol-version": String(OBSYNC_PROTOCOL_VERSION),
             },
-            body: JSON.stringify(request.body),
+            body: JSON.stringify(this.hostedRequestBody(request.body, auth, authMode)),
           },
           JSON_REQUEST_TIMEOUT_MS,
         );
@@ -1090,10 +1108,39 @@ export class SyncHttpApi {
         return (await response.json()) as T;
       }
 
-      const bodyText = response.status === 401 || !isRetryableStatus(response.status)
+      const bodyText = response.status === 400 || response.status === 401 || !isRetryableStatus(response.status)
         ? await response.text()
         : undefined;
-      const ticketExpired = response.status === 401 && isHostedTicketError(bodyText ?? "");
+      const sessionExpired = authMode === "session" &&
+        response.status === 401 &&
+        isHostedSessionError(bodyText ?? "");
+      const legacyRequired = authMode === "session" &&
+        !legacyRetryForCurrentRequest &&
+        (response.status === 400 || response.status === 401) &&
+        isHostedLegacyTicketRequiredError(bodyText ?? "");
+      const ticketExpired = authMode === "legacy" &&
+        response.status === 401 &&
+        isHostedTicketError(bodyText ?? "");
+
+      if (legacyRequired) {
+        this.hostedLegacyModeUntilMs = Date.now() + 60_000;
+        legacyRetryForCurrentRequest = true;
+        continue;
+      }
+
+      if (sessionExpired && !retriedSessionRefresh && attempt < RETRY_DELAYS_MS.length) {
+        this.hostedSession = undefined;
+        forceRefresh = true;
+        retriedSessionRefresh = true;
+        await this.waitBeforeRetry(
+          { label: request.label },
+          attempt,
+          "сервер отклонил сессию синхронизации",
+          0,
+        );
+        continue;
+      }
+
       const retryAllowed = attempt < RETRY_DELAYS_MS.length &&
         (isRetryableStatus(response.status) || (ticketExpired && attempt === 0));
 
@@ -1238,7 +1285,6 @@ export class SyncHttpApi {
       const result = await this.requestHostedJson<HostedUploadResponse>((ticket) => ({
         path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/uploads`,
         body: {
-          ticket: ticket.rawTicket,
           fileId: input.fileId,
           path: input.path,
           kind: input.kind,
@@ -1600,8 +1646,73 @@ export class SyncHttpApi {
     };
   }
 
-  private async hostedTicket(): Promise<HostedSyncTicket> {
-    return issueHostedWsTicket(this.getSettings(), this.saveSettings);
+  private async hostedAuthContext(options: {
+    forceRefresh?: boolean;
+    freshTicket?: boolean;
+  } = {}): Promise<HostedAuthContext> {
+    const now = Date.now();
+    if (
+      !options.forceRefresh &&
+      !options.freshTicket &&
+      this.hostedSession?.syncSessionToken &&
+      (this.hostedSession.sessionUsableUntilMs ?? 0) > now
+    ) {
+      return this.hostedSession;
+    }
+
+    if (!options.forceRefresh && !options.freshTicket && this.hostedSessionRefresh) {
+      return this.hostedSessionRefresh;
+    }
+
+    const refresh = issueHostedWsTicket(this.getSettings(), this.saveSettings)
+      .then((ticket) => this.normalizeHostedAuthContext(ticket));
+
+    if (!options.freshTicket) {
+      this.hostedSessionRefresh = refresh;
+    }
+
+    try {
+      const auth = await refresh;
+      if (auth.syncSessionToken && (auth.sessionUsableUntilMs ?? 0) > Date.now()) {
+        this.hostedSession = auth;
+      } else if (!auth.syncSessionToken && !options.freshTicket) {
+        this.hostedSession = undefined;
+      }
+      return auth;
+    } finally {
+      if (!options.freshTicket && this.hostedSessionRefresh === refresh) {
+        this.hostedSessionRefresh = undefined;
+      }
+    }
+  }
+
+  private normalizeHostedAuthContext(ticket: HostedSyncTicket): HostedAuthContext {
+    const syncSessionToken = ticket.syncSessionToken ?? ticket.rawSyncSessionToken;
+    return {
+      ...ticket,
+      syncSessionToken,
+      sessionUsableUntilMs: syncSessionToken
+        ? hostedSessionUsableUntilMs(ticket.syncSession?.expiresAt)
+        : undefined,
+    };
+  }
+
+  private hostedRequestBody(
+    body: unknown,
+    auth: HostedAuthContext,
+    mode: HostedAuthMode,
+  ): Record<string, unknown> {
+    const payload = body && typeof body === "object" && !Array.isArray(body)
+      ? { ...(body as Record<string, unknown>) }
+      : {};
+    if (mode === "session" && auth.syncSessionToken) {
+      payload.syncSessionToken = auth.syncSessionToken;
+      delete payload.ticket;
+      return payload;
+    }
+    payload.ticket = auth.rawTicket;
+    delete payload.syncSessionToken;
+    return payload;
   }
 
   private hostedUploadResponse(
@@ -1635,7 +1746,7 @@ export class SyncHttpApi {
   }
 
   private async createHostedDownload(path: string): Promise<HostedDownloadSession> {
-    let activeTicket: HostedSyncTicket | undefined;
+    let activeAuth: HostedAuthContext | undefined;
     const result = await this.requestHostedJson<{
       download: {
         id: string;
@@ -1643,20 +1754,19 @@ export class SyncHttpApi {
       };
       transferToken: string;
     }>((ticket) => {
-      activeTicket = ticket;
+      activeAuth = ticket;
       return {
         path: `/sync/tenants/${encodeURIComponent(ticket.sync.tenantId)}/downloads`,
         body: {
-          ticket: ticket.rawTicket,
           path,
         },
         label: `hosted create download ${path}`,
       };
     });
-    if (!activeTicket) throw new Error("сервер не выдал данные tenant для скачивания");
+    if (!activeAuth) throw new Error("сервер не выдал данные tenant для скачивания");
 
     return {
-      tenantId: activeTicket.sync.tenantId,
+      tenantId: activeAuth.sync.tenantId,
       downloadId: result.download.id,
       contentUrl: result.download.contentUrl,
       transferToken: result.transferToken,
@@ -1786,6 +1896,14 @@ function hostedWebControlUrl(serverUrl: string, path: string): string {
     ) {
       return `https://obsync.ru/api/web/control/sync/${normalizedPath}`;
     }
+    if (
+      url.hostname === "obsync.pro" ||
+      url.hostname === "www.obsync.pro" ||
+      url.hostname === "sync.obsync.pro" ||
+      url.hostname === "api.obsync.pro"
+    ) {
+      return `https://obsync.pro/api/web/control/sync/${normalizedPath}`;
+    }
     url.pathname = `/api/web/control/sync/${normalizedPath}`;
     url.search = "";
     url.hash = "";
@@ -1829,6 +1947,35 @@ function isHostedTicketError(body: string): boolean {
   const normalized = body.toLowerCase();
   return normalized.includes("ticket") ||
     normalized.includes("билет");
+}
+
+function isHostedSessionError(body: string): boolean {
+  const normalized = body.toLowerCase();
+  return normalized.includes("sync session") ||
+    normalized.includes("syncsessiontoken") ||
+    normalized.includes("сессию синхронизации") ||
+    normalized.includes("сессия синхронизации");
+}
+
+function isHostedLegacyTicketRequiredError(body: string): boolean {
+  const normalized = body.toLowerCase();
+  return !isHostedSessionError(normalized) &&
+    (
+      normalized.includes("invalid ticket") ||
+      normalized.includes("missing ticket") ||
+      normalized.includes("ws ticket") ||
+      normalized.includes("одноразовый билет")
+    );
+}
+
+function hostedSessionUsableUntilMs(expiresAt: string | undefined): number {
+  const now = Date.now();
+  const expiresAtMs = expiresAt ? Date.parse(expiresAt) : Number.NaN;
+  if (!Number.isFinite(expiresAtMs)) return now + 2 * 60_000;
+  const ttlMs = expiresAtMs - now;
+  if (ttlMs <= 0) return now;
+  const skewMs = Math.max(30_000, Math.floor(ttlMs * 0.1));
+  return Math.max(now, expiresAtMs - skewMs);
 }
 
 function isUnsupportedEndpointError(error: unknown): boolean {

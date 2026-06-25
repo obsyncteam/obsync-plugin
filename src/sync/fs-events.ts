@@ -1,5 +1,5 @@
 import { Notice, Platform, TFile, TFolder, type TAbstractFile, type Vault } from "obsidian";
-import type { ObsyncSettings } from "../settings";
+import { shouldSyncBlobFiles, type ObsyncSettings } from "../settings";
 import { Debouncer } from "../util/debounce";
 import { createRandomId } from "../util/device-id";
 import { sha256Hex } from "../util/hash";
@@ -132,8 +132,10 @@ export class VaultEventBridge {
 
     const path = operation.path;
     if (!path || this.shouldIgnore(path)) return;
+    if (this.isStaleOperation(path, operation)) return;
 
     if (operation.operationType === "delete") {
+      if (!this.matchesKnownFileId(path, operation)) return;
       await this.applyRemoteDelete(path);
       delete this.getSettings().lastFileHashes[path];
       delete this.getSettings().lastFileSeqs[path];
@@ -142,6 +144,7 @@ export class VaultEventBridge {
     }
 
     if (operation.operationType === "rename") {
+      if (!this.matchesKnownFileId(path, operation)) return;
       const newPath = stringPayload(operation.payload, "newPath");
       const validNewPath = newPath
         ? validateVaultPath(newPath, {
@@ -168,10 +171,16 @@ export class VaultEventBridge {
     }
 
     if (operation.operationType === "file_upsert") {
+      if (this.isUnconfirmedLocalIdentity(path, operation)) return;
+
       const kind = stringPayload(operation.payload, "kind");
       const content = stringPayload(operation.payload, "content");
+      const expectedHash = stringPayload(operation.payload, "hash");
       if (kind === "markdown" && content !== undefined) {
         const hash = `sha256:${await sha256Hex(content)}`;
+        if (expectedHash && expectedHash !== hash) {
+          throw new Error(`remote markdown hash mismatch: ${path}`);
+        }
         const result = await this.writeDownloadedFile({
           path,
           kind,
@@ -189,7 +198,34 @@ export class VaultEventBridge {
         return;
       }
 
-      const hash = stringPayload(operation.payload, "hash");
+      const hash = expectedHash;
+      if (kind === "markdown" && hash) {
+        try {
+          const version = await this.httpApi.historyVersion(path, operation.serverSeq);
+          const versionHash = version.hash ?? `sha256:${await sha256Hex(version.content)}`;
+          if (versionHash !== hash) {
+            throw new Error(`remote markdown version hash mismatch: ${path}`);
+          }
+          const result = await this.writeDownloadedFile({
+            path,
+            kind,
+            body: new TextEncoder().encode(version.content).buffer,
+            hash: versionHash,
+            overwrite: false,
+          });
+          if (result !== "conflict") {
+            this.getSettings().lastFileHashes[path] = versionHash;
+            this.getSettings().lastFileSeqs[path] = operation.serverSeq;
+            if (operation.fileId) this.getSettings().fileIds[path] = operation.fileId;
+          } else {
+            new Notice(`obsync conflict: kept local note "${path}" unchanged`);
+          }
+          return;
+        } catch (error) {
+          console.warn("[obsync] versioned markdown download failed, falling back to hash-checked current download", error);
+        }
+      }
+
       const result = await this.writeDownloadedFileFromServer({
         path,
         kind: kind ?? "blob",
@@ -203,6 +239,25 @@ export class VaultEventBridge {
         if (operation.fileId) this.getSettings().fileIds[path] = operation.fileId;
       }
     }
+  }
+
+  private isStaleOperation(path: string, operation: ServerOperation): boolean {
+    const lastSeq = this.getSettings().lastFileSeqs[path];
+    return lastSeq !== undefined && operation.serverSeq <= lastSeq;
+  }
+
+  private matchesKnownFileId(path: string, operation: ServerOperation): boolean {
+    if (!operation.fileId) return true;
+    const knownFileId = this.getSettings().fileIds[path];
+    return !knownFileId || knownFileId === operation.fileId;
+  }
+
+  private isUnconfirmedLocalIdentity(path: string, operation: ServerOperation): boolean {
+    if (!operation.fileId) return false;
+    const settings = this.getSettings();
+    const knownFileId = settings.fileIds[path];
+    if (!knownFileId || knownFileId === operation.fileId) return false;
+    return settings.lastFileSeqs[path] === undefined && settings.lastFileHashes[path] === undefined;
   }
 
   isIgnored(path: string): boolean {
@@ -251,12 +306,14 @@ export class VaultEventBridge {
         adapter: this.vault.adapter,
         tempPath: stagedTarget.tempPath,
         targetPath: stagedTarget.targetPath,
+        expectedHash: input.hash,
         beforeCommit: () => this.echoSuppression.suppress(stagedTarget.targetPath),
       });
       return stagedTarget.result;
     }
 
     const downloaded = await this.httpApi.downloadFile(input.path, input.sizeBytes);
+    this.assertDownloadedHash(input.path, downloaded.hash, input.hash);
     return this.writeDownloadedFile({
       path: input.path,
       kind: input.kind,
@@ -265,6 +322,11 @@ export class VaultEventBridge {
       hash: downloaded.hash ?? input.hash,
       overwrite: input.overwrite,
     });
+  }
+
+  private assertDownloadedHash(path: string, actualHash?: string, expectedHash?: string): void {
+    if (!actualHash || !expectedHash || actualHash === expectedHash) return;
+    throw new Error(`downloaded file version mismatch: ${path}`);
   }
 
   private queueUpsert(file: TAbstractFile): void {
@@ -347,7 +409,7 @@ export class VaultEventBridge {
 
   private async sendFileUpsert(file: TFile): Promise<void> {
     const kind = this.kindFor(file);
-    if (kind !== "markdown" && !this.getSettings().syncAttachments) return;
+    if (kind !== "markdown" && !shouldSyncBlobFiles(this.getSettings())) return;
 
     const maxBytes = this.getSettings().maxAttachmentMB * 1024 * 1024;
     if (file.stat.size > maxBytes) return;

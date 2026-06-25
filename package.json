@@ -1,7 +1,7 @@
 {
   "name": "obsync",
-  "version": "1.6.20.3",
-  "description": "Obsidian plugin for obsync sync",
+  "version": "1.6.25",
+  "description": "Obsidian plugin for Obsync sync",
   "main": "main.js",
   "scripts": {
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",

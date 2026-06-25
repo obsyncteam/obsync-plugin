@@ -6,6 +6,7 @@ import { t } from "./i18n";
 export type SetupMode = "primary" | "secondary";
 export type SyncBackend = "standalone" | "hosted";
 export type DeletedServerFilePolicy = "server_wins" | "conflict_copy";
+export type FileSyncMode = "markdown_only" | "all_supported";
 
 export interface PendingUploadState {
   uploadId: string;
@@ -29,7 +30,13 @@ export interface PendingUploadState {
 export interface SkippedFileState {
   path: string;
   sizeBytes: number;
-  reason: "large" | "attachments-disabled" | "server-deleted" | "delete-context-unavailable";
+  reason:
+    | "large"
+    | "attachments-disabled"
+    | "server-deleted"
+    | "delete-context-unavailable"
+    | "unsupported-path"
+    | "path-segment-too-long";
   skippedAt: number;
 }
 
@@ -60,6 +67,10 @@ export interface PendingSeqUpdate {
 
 export interface ObsyncSettings {
   enabled: boolean;
+  safeMode: boolean;
+  consecutiveStartupFailures: number;
+  lastStartupFailure?: string;
+  lastStartupFailureAt?: number;
   syncBackend: SyncBackend;
   serverUrl: string;
   authToken: string;
@@ -73,6 +84,7 @@ export interface ObsyncSettings {
   deviceLabel: string;
   deviceId: string;
   deviceName: string;
+  fileSyncMode: FileSyncMode;
   syncAttachments: boolean;
   syncObsidianConfig: boolean;
   deletedServerFilePolicy: DeletedServerFilePolicy;
@@ -93,6 +105,10 @@ export interface ObsyncSettings {
 
 export const DEFAULT_SETTINGS: ObsyncSettings = {
   enabled: true,
+  safeMode: false,
+  consecutiveStartupFailures: 0,
+  lastStartupFailure: undefined,
+  lastStartupFailureAt: undefined,
   syncBackend: "hosted",
   serverUrl: "https://obsync.ru",
   authToken: "",
@@ -106,7 +122,8 @@ export const DEFAULT_SETTINGS: ObsyncSettings = {
   deviceLabel: "pc",
   deviceId: "",
   deviceName: "",
-  syncAttachments: true,
+  fileSyncMode: "markdown_only",
+  syncAttachments: false,
   syncObsidianConfig: false,
   deletedServerFilePolicy: "server_wins",
   maxAttachmentMB: 100,
@@ -122,13 +139,35 @@ export const DEFAULT_SETTINGS: ObsyncSettings = {
   publishLinks: {},
 };
 
+export function mergeSettingsWithDefaults(raw: unknown): ObsyncSettings {
+  const stored = raw && typeof raw === "object" ? raw as Partial<ObsyncSettings> : {};
+  const fileSyncMode = normalizeFileSyncMode(stored.fileSyncMode, stored.syncAttachments);
+  return {
+    ...DEFAULT_SETTINGS,
+    ...stored,
+    fileSyncMode,
+    syncAttachments: shouldSyncBlobFiles({ ...DEFAULT_SETTINGS, ...stored, fileSyncMode }),
+  } as ObsyncSettings;
+}
+
 export async function normalizeSettings(settings: ObsyncSettings): Promise<ObsyncSettings> {
   const { publishMode: _legacyPublishMode, ...baseSettings } = settings as ObsyncSettings & {
     publishMode?: unknown;
   };
+  const fileSyncMode = normalizeFileSyncMode(settings.fileSyncMode, settings.syncAttachments);
   return recomputeDerivedIds({
     ...baseSettings,
-    enabled: true,
+    enabled: settings.enabled ?? true,
+    safeMode: settings.safeMode ?? false,
+    consecutiveStartupFailures: Number.isFinite(settings.consecutiveStartupFailures)
+      ? Math.max(0, settings.consecutiveStartupFailures)
+      : 0,
+    lastStartupFailure: typeof settings.lastStartupFailure === "string"
+      ? settings.lastStartupFailure.slice(0, 240)
+      : undefined,
+    lastStartupFailureAt: Number.isFinite(settings.lastStartupFailureAt)
+      ? settings.lastStartupFailureAt
+      : undefined,
     syncBackend: settings.syncBackend === "hosted" ? "hosted" : "standalone",
     serverUrl: settings.serverUrl.replace(/\/+$/, ""),
     hostedTenantId: settings.hostedTenantId ?? "",
@@ -140,11 +179,17 @@ export async function normalizeSettings(settings: ObsyncSettings): Promise<Obsyn
     pendingSeqUpdates: settings.pendingSeqUpdates ?? {},
     pendingUploads: settings.pendingUploads ?? {},
     lastSkippedFiles: settings.lastSkippedFiles ?? [],
+    fileSyncMode,
+    syncAttachments: fileSyncMode === "all_supported",
     syncObsidianConfig: false,
     deletedServerFilePolicy: normalizeDeletedServerFilePolicy(settings.deletedServerFilePolicy),
     publishFolder: normalizePublishFolder(settings.publishFolder ?? ""),
     publishLinks: settings.publishLinks ?? {},
   });
+}
+
+export function shouldSyncBlobFiles(settings: Pick<ObsyncSettings, "fileSyncMode" | "syncAttachments">): boolean {
+  return normalizeFileSyncMode(settings.fileSyncMode, settings.syncAttachments) === "all_supported";
 }
 
 export function recomputeDerivedIds(settings: ObsyncSettings): ObsyncSettings {
@@ -241,6 +286,14 @@ function normalizePublishFolder(value: string): string {
     .replace(/\\/g, "/")
     .replace(/\/+/g, "/")
     .replace(/\/+$/g, "");
+}
+
+export function normalizeFileSyncMode(
+  value: unknown,
+  legacySyncAttachments: unknown,
+): FileSyncMode {
+  if (value === "markdown_only" || value === "all_supported") return value;
+  return legacySyncAttachments === true ? "all_supported" : "markdown_only";
 }
 
 function normalizeDeletedServerFilePolicy(value: unknown): DeletedServerFilePolicy {
@@ -375,6 +428,23 @@ export class ObsyncSettingTab extends PluginSettingTab {
     this.plugin.progressStatusEl = progressSetting.descEl;
     this.plugin.progressStatusEl.addClass("obsync-progress-description");
 
+    if (this.plugin.settings.safeMode) {
+      new Setting(connectionSection)
+        .setName(t("settings_safe_mode"))
+        .setDesc(t("settings_safe_mode_desc", {
+          message: this.plugin.settings.lastStartupFailure ?? t("settings_identity_value_unknown"),
+        }))
+        .addButton((button) => {
+          button
+            .setButtonText(t("settings_safe_mode_resume"))
+            .setCta()
+            .onClick(async () => {
+              await this.plugin.resumeBackgroundSync();
+              this.display();
+            });
+        });
+    }
+
     new Setting(connectionSection)
       .setName(t("settings_skipped_files"))
       .setDesc(this.plugin.skippedFilesText)
@@ -403,13 +473,18 @@ export class ObsyncSettingTab extends PluginSettingTab {
       ].join("\n"));
 
     new Setting(connectionSection)
-      .setName(t("settings_sync_attachments"))
-      .addToggle((toggle) => {
-        toggle.setValue(this.plugin.settings.syncAttachments);
-        toggle.onChange(async (value) => {
-          this.plugin.settings.syncAttachments = value;
-          await this.plugin.saveSettings();
-        });
+      .setName(t("settings_file_sync_mode"))
+      .setDesc(t("settings_file_sync_mode_desc"))
+      .addDropdown((dropdown) => {
+        dropdown
+          .addOption("markdown_only", t("settings_file_sync_mode_markdown_only"))
+          .addOption("all_supported", t("settings_file_sync_mode_all_supported"))
+          .setValue(this.plugin.settings.fileSyncMode)
+          .onChange(async (value) => {
+            this.plugin.settings.fileSyncMode = normalizeFileSyncMode(value, this.plugin.settings.syncAttachments);
+            this.plugin.settings.syncAttachments = shouldSyncBlobFiles(this.plugin.settings);
+            await this.plugin.saveSettings();
+          });
       });
 
     new Setting(connectionSection)

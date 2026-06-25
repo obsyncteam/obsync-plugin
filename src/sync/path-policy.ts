@@ -4,9 +4,11 @@ export interface VaultPathPolicy {
 }
 
 const MAX_VAULT_PATH_LENGTH = 4096;
+const MAX_VAULT_PATH_SEGMENT_BYTES = 255;
 const WINDOWS_DRIVE_PATH = /^[a-zA-Z]:[\\/]/;
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 const ENCODED_TRAVERSAL = /%(?:2e|2f|5c)/i;
+const TEXT_ENCODER = new TextEncoder();
 
 const ALWAYS_BLOCKED_PATHS = new Set([
   ".obsidian/plugins/obsync",
@@ -28,6 +30,9 @@ export function validateVaultPath(
 
   const segments = normalized.split("/");
   if (segments.some((segment) => !segment || segment === "." || segment === "..")) {
+    return undefined;
+  }
+  if (segments.some((segment) => TEXT_ENCODER.encode(segment).byteLength > MAX_VAULT_PATH_SEGMENT_BYTES)) {
     return undefined;
   }
 

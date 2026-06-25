@@ -22,6 +22,7 @@ export class SyncClient {
   private manuallyClosed = false;
   private reconnectAttempts = 0;
   private readonly listeners = new Set<EventHandler>();
+  private eventQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly getSettings: () => ObsyncSettings,
@@ -200,8 +201,15 @@ export class SyncClient {
   }
 
   private emit(event: SyncClientEvent): void {
-    for (const listener of this.listeners) {
-      void listener(event);
-    }
+    const run = async (): Promise<void> => {
+      for (const listener of this.listeners) {
+        await listener(event);
+      }
+    };
+
+    const queued = this.eventQueue.then(run, run);
+    this.eventQueue = queued.catch((error) => {
+      console.error("[obsync] sync client event listener failed", error);
+    });
   }
 }

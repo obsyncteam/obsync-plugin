@@ -2,7 +2,7 @@
 
 [English version](README.md)
 
-[![Версия](https://img.shields.io/badge/version-1.6.20.3-green.svg)](manifest.json)
+[![Версия](https://img.shields.io/badge/version-1.6.25-green.svg)](manifest.json)
 [![AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 
 Плагин Obsidian для Obsync. Он подключает хранилище Obsidian к [self-hosted серверу Obsync Community Edition](https://obsync.ru/ce?utm_source=github&utm_medium=repo_readme) или к [облачному сервису Obsync](https://obsync.ru/?utm_source=github&utm_medium=repo_readme).
@@ -19,7 +19,7 @@
 Скачайте архив релиза:
 
 ```text
-obsync_v1.6.20.3.zip
+obsync_v1.6.25.zip
 ```
 
 Распакуйте его в хранилище Obsidian:
@@ -72,7 +72,7 @@ npm run pack
 Имя архива:
 
 ```text
-obsync_v1.6.20.3.zip
+obsync_v1.6.25.zip
 ```
 
 Структура архива:

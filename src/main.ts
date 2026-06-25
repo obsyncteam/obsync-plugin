@@ -1,9 +1,11 @@
 import { Modal, Notice, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
 import {
   DEFAULT_SETTINGS,
+  mergeSettingsWithDefaults,
   normalizeSettings,
   ObsyncSettingTab,
   recomputeDerivedIds,
+  shouldSyncBlobFiles,
   type PendingUploadState,
   type SkippedFileState,
   type StorageUsageState,
@@ -30,11 +32,15 @@ import {
   type UploadedFile,
 } from "./sync/http-api";
 import { isHostedSync } from "./sync/hosted-auth";
-import type { SyncClientEvent } from "./sync/types";
+import { validateVaultPath } from "./sync/path-policy";
+import type { ServerOperation, SyncClientEvent } from "./sync/types";
 import { createRandomId } from "./util/device-id";
 import { sha256Hex } from "./util/hash";
 
 const HOSTED_UPLOAD_WINDOW_SIZE = 32;
+const STARTUP_SAFE_MODE_FAILURES = 3;
+const MAX_VAULT_PATH_SEGMENT_BYTES = 255;
+const TEXT_ENCODER = new TextEncoder();
 
 type WriteResult = "created" | "updated" | "conflict" | "skipped";
 
@@ -96,6 +102,7 @@ export default class ObsyncPlugin extends Plugin {
   private publicationJobRunning = false;
   private readonly postSyncQueue: Array<{ label: string; run: () => Promise<void> }> = [];
   private activeManualUploadProgress?: ManualUploadProgress;
+  private activeDownloadSkippedFiles: SkippedFileState[] = [];
   private shareIndicatorObserver?: MutationObserver;
   private shareIndicatorRefreshTimer?: number;
   private shareCatalogLastLoadedAt = 0;
@@ -141,9 +148,17 @@ export default class ObsyncPlugin extends Plugin {
     this.registerShareIndicators();
     this.registerVaultEvents();
 
-    if (this.settings.enabled) {
+    if (this.settings.safeMode) {
+      const message = this.settings.lastStartupFailure || t("status_waiting");
+      this.statusText = t("status_safe_mode", { message });
+      this.setProgress(this.statusText);
+    } else if (this.settings.enabled) {
       const startupTimer = window.setTimeout(() => {
-        void this.startSync().catch((error) => this.handleStartupSyncError(error));
+        void this.startSync().catch((error) => {
+          void this.handleStartupSyncError(error).catch((handlerError) => {
+            console.warn("[obsync] startup error handler failed", handlerError);
+          });
+        });
       }, 500);
       this.register(() => window.clearTimeout(startupTimer));
     }
@@ -160,9 +175,11 @@ export default class ObsyncPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    const loaded = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    this.settings = await normalizeSettings(loaded);
-    await this.saveSettings();
+    const loaded = mergeSettingsWithDefaults(await this.loadData());
+    const normalized = await normalizeSettings(loaded);
+    const shouldSave = normalizedSettingsChanged(loaded, normalized);
+    this.settings = normalized;
+    if (shouldSave) await this.saveSettings();
   }
 
   async saveSettings(): Promise<void> {
@@ -243,7 +260,17 @@ export default class ObsyncPlugin extends Plugin {
 
   async restartSync(): Promise<void> {
     this.syncClient?.disconnect();
+    this.settings.safeMode = false;
+    this.settings.consecutiveStartupFailures = 0;
+    this.settings.lastStartupFailure = undefined;
+    this.settings.lastStartupFailureAt = undefined;
+    await this.saveSettings();
     await this.startSync();
+  }
+
+  async resumeBackgroundSync(): Promise<void> {
+    this.settings.enabled = true;
+    await this.restartSync();
   }
 
   async installVault(): Promise<void> {
@@ -290,6 +317,7 @@ export default class ObsyncPlugin extends Plugin {
 
       const stats = await this.uploadFiles(api, files);
       this.settings.vaultLocked = true;
+      this.repairCursorFromKnownFileSeqs();
       await this.saveSettings();
       this.setProgress(
         t("progress_sync_completed", {
@@ -324,6 +352,7 @@ export default class ObsyncPlugin extends Plugin {
     const syncStartedAt = Date.now();
 
     this.syncJobRunning = true;
+    this.activeDownloadSkippedFiles = [];
     try {
       this.reportClientSyncEvent(api, {
         eventType: "sync_started",
@@ -527,13 +556,14 @@ export default class ObsyncPlugin extends Plugin {
         [...uploadQueue.values()],
         { preconditionsByPath: uploadPreconditionsByPath },
       );
-      if (preUploadSkippedFiles.length > 0) {
+      if (preUploadSkippedFiles.length > 0 || this.activeDownloadSkippedFiles.length > 0) {
         uploadStats.skipped += preUploadSkippedFiles.length;
         uploadStats.skippedFiles = [
+          ...this.activeDownloadSkippedFiles,
           ...preUploadSkippedFiles,
           ...uploadStats.skippedFiles,
         ];
-        this.settings.lastSkippedFiles = uploadStats.skippedFiles.slice(0, 50);
+        this.settings.lastSkippedFiles = this.mergeSkippedFiles(uploadStats.skippedFiles);
       }
 
       if (initialHostedUpload) {
@@ -547,6 +577,7 @@ export default class ObsyncPlugin extends Plugin {
       ) {
         this.settings.vaultLocked = true;
       }
+      this.repairCursorFromKnownFileSeqs();
       await this.saveSettings();
       this.setProgress(
         t("progress_sync_completed", {
@@ -613,6 +644,11 @@ export default class ObsyncPlugin extends Plugin {
     return manifest.filter((file) => {
       if (file.deletedAt) return false;
       if (file.kind === "folder") return false;
+      const skipReason = this.serverPathLocalSkipReason(file.path);
+      if (skipReason) {
+        this.addSkippedServerFile(file, skipReason);
+        return false;
+      }
       if (bridge.isIgnored(file.path)) return false;
       return true;
     });
@@ -624,7 +660,10 @@ export default class ObsyncPlugin extends Plugin {
   ): ManifestFile[] {
     return this.activeServerFiles(manifest, bridge).filter((file) => {
       if (!file.storageKey) return false;
-      if (file.kind !== "markdown" && !this.settings.syncAttachments) return false;
+      if (file.kind !== "markdown" && !shouldSyncBlobFiles(this.settings)) {
+        this.addSkippedServerFile(file, "attachments-disabled");
+        return false;
+      }
       return true;
     });
   }
@@ -632,7 +671,7 @@ export default class ObsyncPlugin extends Plugin {
   private syncableLocalFiles(bridge: VaultEventBridge): TFile[] {
     return this.app.vault.getFiles().filter((file) => {
       if (bridge.isIgnored(file.path)) return false;
-      if (this.kindForFile(file) !== "markdown" && !this.settings.syncAttachments) {
+      if (this.kindForFile(file) !== "markdown" && !shouldSyncBlobFiles(this.settings)) {
         return false;
       }
       return true;
@@ -721,7 +760,7 @@ export default class ObsyncPlugin extends Plugin {
       };
       this.setProgress(this.formatUploadProgress());
 
-      if (kind !== "markdown" && !this.settings.syncAttachments) {
+      if (kind !== "markdown" && !shouldSyncBlobFiles(this.settings)) {
         skipped += 1;
         skippedFiles.push(this.skippedFile(file, "attachments-disabled"));
         uploadProgress.processedFiles += 1;
@@ -781,7 +820,7 @@ export default class ObsyncPlugin extends Plugin {
 
       const windowFiles = files.slice(fromIndex, toIndex).filter((file) => {
         const kind = this.kindForFile(file);
-        if (kind !== "markdown" && !this.settings.syncAttachments) return false;
+        if (kind !== "markdown" && !shouldSyncBlobFiles(this.settings)) return false;
         return file.stat.size <= maxBytes;
       });
       if (windowFiles.length === 0) return;
@@ -1001,13 +1040,21 @@ export default class ObsyncPlugin extends Plugin {
     overwrite: boolean,
   ): Promise<WriteResult> {
     void api;
-    const result = await bridge.writeDownloadedFileFromServer({
-      path: file.path,
-      kind: file.kind,
-      hash: file.hash,
-      sizeBytes: file.sizeBytes,
-      overwrite,
-    });
+    let result: WriteResult;
+    try {
+      result = await bridge.writeDownloadedFileFromServer({
+        path: file.path,
+        kind: file.kind,
+        hash: file.hash,
+        sizeBytes: file.sizeBytes,
+        overwrite,
+      });
+    } catch (error) {
+      if (!this.isUnsupportedLocalWrite(error)) throw error;
+      this.addSkippedServerFile(file, "unsupported-path");
+      console.warn("[obsync] skipped unsupported local file", { path: file.path, error });
+      return "skipped";
+    }
 
     if (file.hash && result !== "conflict") {
       this.trackServerFile(file);
@@ -1021,7 +1068,9 @@ export default class ObsyncPlugin extends Plugin {
   private trackServerFile(file: ManifestFile): void {
     this.settings.fileIds[file.path] = file.fileId;
     if (file.hash) this.settings.lastFileHashes[file.path] = file.hash;
-    if (file.updatedSeq !== undefined) this.settings.lastFileSeqs[file.path] = file.updatedSeq;
+    if (file.updatedSeq !== undefined) {
+      this.settings.lastFileSeqs[file.path] = file.updatedSeq;
+    }
   }
 
   private applyWriteResult(stats: DownloadStats, result: WriteResult): void {
@@ -1084,8 +1133,23 @@ export default class ObsyncPlugin extends Plugin {
   }
 
   private async startSync(): Promise<void> {
-    this.settings = await normalizeSettings(this.settings);
-    await this.saveSettings();
+    const normalized = await normalizeSettings(this.settings);
+    const shouldSave = normalizedSettingsChanged(this.settings, normalized);
+    this.settings = normalized;
+    if (shouldSave) await this.saveSettings();
+
+    if (!this.settings.enabled) {
+      this.statusText = t("sync_status_client_disabled");
+      this.setProgress(this.statusText);
+      return;
+    }
+
+    if (this.settings.safeMode) {
+      const message = this.settings.lastStartupFailure || t("status_waiting");
+      this.statusText = t("status_safe_mode", { message });
+      this.setProgress(this.statusText);
+      return;
+    }
 
     this.httpApi = new SyncHttpApi(
       () => this.settings,
@@ -1116,13 +1180,27 @@ export default class ObsyncPlugin extends Plugin {
       this.echoSuppression,
     );
 
+    this.settings.consecutiveStartupFailures = 0;
+    this.settings.lastStartupFailure = undefined;
+    this.settings.lastStartupFailureAt = undefined;
+    await this.saveSettings();
     this.syncClient.connect();
   }
 
-  private handleStartupSyncError(error: unknown): void {
+  private async handleStartupSyncError(error: unknown): Promise<void> {
     const message = this.errorMessage(error);
-    this.statusText = t("status_startup_failed", { message });
-    this.setProgress(t("progress_connection_error", { message }));
+    this.settings.consecutiveStartupFailures = (this.settings.consecutiveStartupFailures ?? 0) + 1;
+    this.settings.lastStartupFailure = message.slice(0, 240);
+    this.settings.lastStartupFailureAt = Date.now();
+    if (this.settings.consecutiveStartupFailures >= STARTUP_SAFE_MODE_FAILURES) {
+      this.settings.safeMode = true;
+      this.statusText = t("status_safe_mode", { message });
+      this.setProgress(this.statusText);
+    } else {
+      this.statusText = t("status_startup_failed", { message });
+      this.setProgress(t("progress_connection_error", { message }));
+    }
+    await this.saveSettings();
     this.notice("status_startup_failed", { message }, 12000);
     console.warn("[obsync] startup sync failed", error);
   }
@@ -1249,7 +1327,7 @@ export default class ObsyncPlugin extends Plugin {
       const result = await api.createNoteShare({
         sourcePath: file.path,
         title: file.basename,
-        includeAttachments: this.settings.syncAttachments,
+        includeAttachments: shouldSyncBlobFiles(this.settings),
       });
       const shareUrl = this.publishUrlForResult(result, "note", file.path);
       await this.saveSettings();
@@ -1334,7 +1412,7 @@ export default class ObsyncPlugin extends Plugin {
       const result = await api.publishSite({
         sourcePath: folderPath,
         title: folder.name,
-        includeAttachments: this.settings.syncAttachments,
+        includeAttachments: shouldSyncBlobFiles(this.settings),
       });
       const shareUrl = this.publishUrlForResult(result, "folder", folderPath);
       await this.saveSettings();
@@ -1547,13 +1625,32 @@ export default class ObsyncPlugin extends Plugin {
 
     if (event.type === "operation") {
       try {
+        if (this.isStaleSyncOperation(event.operation)) {
+          this.advanceCursor(event.operation.serverSeq);
+          await this.saveSettings();
+          return;
+        }
+        const skipReason = this.serverOperationLocalSkipReason(event.operation);
+        if (skipReason) {
+          this.addSkippedServerOperation(event.operation, skipReason);
+          this.advanceCursor(event.operation.serverSeq);
+          await this.saveSettings();
+          return;
+        }
         await this.bridge?.applyRemoteOperation(event.operation);
-        this.settings.lastCursor = Math.max(
-          this.settings.lastCursor,
-          event.operation.serverSeq,
-        );
+        this.advanceCursor(event.operation.serverSeq);
         await this.saveSettings();
       } catch (error) {
+        if (this.isUnsupportedLocalWrite(error)) {
+          this.addSkippedServerOperation(event.operation, "unsupported-path");
+          this.advanceCursor(event.operation.serverSeq);
+          await this.saveSettings();
+          console.warn("[obsync] skipped unsupported live operation", {
+            path: event.operation.path,
+            error,
+          });
+          return;
+        }
         const message = this.errorMessage(error);
         this.setProgress(t("status_apply_changes_error", { message }));
         console.error("[obsync] remote apply failed", error);
@@ -1568,8 +1665,10 @@ export default class ObsyncPlugin extends Plugin {
   }
 
   private async ensureManualSyncReady(): Promise<void> {
-    this.settings = await normalizeSettings(this.settings);
-    await this.saveSettings();
+    const normalized = await normalizeSettings(this.settings);
+    const shouldSave = normalizedSettingsChanged(this.settings, normalized);
+    this.settings = normalized;
+    if (shouldSave) await this.saveSettings();
 
     if (!this.settings.authToken) {
       throw new Error(t("sync_status_no_token"));
@@ -1658,6 +1757,24 @@ export default class ObsyncPlugin extends Plugin {
     }
 
     delete this.settings.pendingSeqUpdates[opId];
+  }
+
+  private isStaleSyncOperation(operation: { serverSeq: number; path?: string }): boolean {
+    if (operation.serverSeq <= this.settings.lastCursor) return true;
+    if (!operation.path) return false;
+    const lastSeq = this.settings.lastFileSeqs[operation.path];
+    return lastSeq !== undefined && operation.serverSeq <= lastSeq;
+  }
+
+  private advanceCursor(serverSeq: number | undefined): void {
+    if (serverSeq === undefined || !Number.isFinite(serverSeq)) return;
+    this.settings.lastCursor = Math.max(this.settings.lastCursor, serverSeq);
+  }
+
+  private repairCursorFromKnownFileSeqs(): void {
+    for (const seq of Object.values(this.settings.lastFileSeqs)) {
+      this.advanceCursor(seq);
+    }
   }
 
   private setProgress(progress: string): void {
@@ -2081,6 +2198,86 @@ export default class ObsyncPlugin extends Plugin {
     };
   }
 
+  private addSkippedServerFile(file: ManifestFile, reason: SkippedFileState["reason"]): void {
+    const skipped = {
+      path: file.path,
+      sizeBytes: file.sizeBytes ?? 0,
+      reason,
+      skippedAt: Date.now(),
+    };
+    this.activeDownloadSkippedFiles = this.mergeSkippedFiles([
+      skipped,
+      ...this.activeDownloadSkippedFiles,
+    ]);
+    this.settings.lastSkippedFiles = this.mergeSkippedFiles([
+      skipped,
+      ...this.settings.lastSkippedFiles,
+    ]);
+  }
+
+  private addSkippedServerOperation(
+    operation: ServerOperation,
+    reason: SkippedFileState["reason"],
+  ): void {
+    if (!operation.path) return;
+    const sizeBytes = typeof operation.payload.sizeBytes === "number"
+      ? operation.payload.sizeBytes
+      : 0;
+    this.addSkippedServerFile({
+      vaultId: operation.vaultId,
+      fileId: operation.fileId ?? operation.path,
+      path: operation.path,
+      kind: typeof operation.payload.kind === "string" ? operation.payload.kind : "markdown",
+      sizeBytes,
+      updatedSeq: operation.serverSeq,
+    }, reason);
+  }
+
+  private serverOperationLocalSkipReason(operation: ServerOperation): SkippedFileState["reason"] | undefined {
+    if (!operation.path) return undefined;
+    const pathReason = this.serverPathLocalSkipReason(operation.path);
+    if (pathReason) return pathReason;
+    const kind = typeof operation.payload.kind === "string" ? operation.payload.kind : undefined;
+    if (kind && kind !== "markdown" && !shouldSyncBlobFiles(this.settings)) {
+      return "attachments-disabled";
+    }
+    return undefined;
+  }
+
+  private serverPathLocalSkipReason(path: string): SkippedFileState["reason"] | undefined {
+    const validPath = validateVaultPath(path, {
+      allowObsidianConfig: true,
+      allowObsidianPlugins: true,
+    });
+    if (validPath) return undefined;
+    return this.hasPathSegmentOverLocalLimit(path) ? "path-segment-too-long" : "unsupported-path";
+  }
+
+  private hasPathSegmentOverLocalLimit(path: string): boolean {
+    return path
+      .normalize("NFC")
+      .replace(/\\/g, "/")
+      .split("/")
+      .some((segment) => TEXT_ENCODER.encode(segment).byteLength > MAX_VAULT_PATH_SEGMENT_BYTES);
+  }
+
+  private mergeSkippedFiles(files: SkippedFileState[]): SkippedFileState[] {
+    const byPath = new Map<string, SkippedFileState>();
+    for (const file of files) {
+      if (!byPath.has(file.path)) byPath.set(file.path, file);
+    }
+    return [...byPath.values()].slice(0, 50);
+  }
+
+  private isUnsupportedLocalWrite(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/\b(?:401|403|404|409|412|500|502|503|504)\b/.test(message)) return false;
+    if (/invalid (?:or expired )?(?:ws )?ticket|invalid sync session|inactive device|token/i.test(message)) {
+      return false;
+    }
+    return /FILE_NOTCREATED|not\s*created|ENAMETOOLONG|EINVAL|EACCES|EPERM|ENOENT/i.test(message);
+  }
+
   private skippedSuffix(stats: UploadStats): string {
     const largeCount = stats.skippedFiles.filter((file) => file.reason === "large").length;
     if (largeCount === 0) return t("skipped_files_limit_suffix_zero");
@@ -2344,6 +2541,48 @@ function historyActionLabel(entry: HistoryEntry): string {
     target: entry.targetPath ?? "unknown",
   });
   return entry.operationType;
+}
+
+const NORMALIZED_SETTINGS_KEYS: Array<keyof ObsyncSettings> = [
+  "enabled",
+  "safeMode",
+  "consecutiveStartupFailures",
+  "lastStartupFailure",
+  "lastStartupFailureAt",
+  "syncBackend",
+  "serverUrl",
+  "hostedTenantId",
+  "hostedVaultId",
+  "hostedSyncBaseUrl",
+  "userId",
+  "vaultName",
+  "vaultLocked",
+  "vaultId",
+  "deviceLabel",
+  "deviceId",
+  "deviceName",
+  "fileSyncMode",
+  "syncAttachments",
+  "syncObsidianConfig",
+  "deletedServerFilePolicy",
+  "maxAttachmentMB",
+  "ignoredPatterns",
+  "lastCursor",
+  "fileIds",
+  "lastFileHashes",
+  "lastFileSeqs",
+  "pendingSeqUpdates",
+  "pendingUploads",
+  "lastSkippedFiles",
+  "lastStorageUsage",
+  "lastCompatibility",
+  "publishFolder",
+  "publishLinks",
+];
+
+function normalizedSettingsChanged(before: ObsyncSettings, after: ObsyncSettings): boolean {
+  if ("publishMode" in (before as ObsyncSettings & { publishMode?: unknown })) return true;
+  return NORMALIZED_SETTINGS_KEYS.some((key) => !Object.is(before[key], after[key]));
 }
 
 function historyMeta(entry: HistoryEntry): string {
