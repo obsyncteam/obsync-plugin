@@ -748,6 +748,7 @@ export default class ObsyncPlugin extends Plugin {
     let uploaded = 0;
     let skipped = 0;
     const skippedFiles: SkippedFileState[] = [];
+    const localSkipReasons = new Map<string, SkippedFileState["reason"]>();
 
     const uploadOne = async (index: number): Promise<void> => {
       const file = files[index];
@@ -773,6 +774,17 @@ export default class ObsyncPlugin extends Plugin {
       if (file.stat.size > maxBytes) {
         skipped += 1;
         skippedFiles.push(this.skippedFile(file, "large"));
+        uploadProgress.processedFiles += 1;
+        uploadProgress.processedBytes += file.stat.size;
+        delete uploadProgress.activeFiles[file.path];
+        this.setProgress(this.formatUploadProgress());
+        return;
+      }
+
+      const localSkipReason = localSkipReasons.get(file.path) ?? this.localFileSkipReason(file);
+      if (localSkipReason) {
+        skipped += 1;
+        skippedFiles.push(this.skippedFile(file, localSkipReason));
         uploadProgress.processedFiles += 1;
         uploadProgress.processedBytes += file.stat.size;
         delete uploadProgress.activeFiles[file.path];
@@ -821,6 +833,11 @@ export default class ObsyncPlugin extends Plugin {
       const windowFiles = files.slice(fromIndex, toIndex).filter((file) => {
         const kind = this.kindForFile(file);
         if (kind !== "markdown" && !shouldSyncBlobFiles(this.settings)) return false;
+        const localSkipReason = this.localFileSkipReason(file);
+        if (localSkipReason) {
+          localSkipReasons.set(file.path, localSkipReason);
+          return false;
+        }
         return file.stat.size <= maxBytes;
       });
       if (windowFiles.length === 0) return;
@@ -2196,6 +2213,15 @@ export default class ObsyncPlugin extends Plugin {
       reason,
       skippedAt: Date.now(),
     };
+  }
+
+  private localFileSkipReason(file: TFile): SkippedFileState["reason"] | undefined {
+    const validPath = validateVaultPath(file.path, {
+      allowObsidianConfig: this.settings.syncObsidianConfig,
+      allowObsidianPlugins: this.settings.syncObsidianConfig,
+    });
+    if (validPath) return undefined;
+    return this.hasPathSegmentOverLocalLimit(file.path) ? "path-segment-too-long" : "unsupported-path";
   }
 
   private addSkippedServerFile(file: ManifestFile, reason: SkippedFileState["reason"]): void {

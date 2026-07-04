@@ -1,6 +1,6 @@
 {
   "name": "obsync",
-  "version": "1.6.25",
+  "version": "1.7.4",
   "description": "Obsidian plugin for Obsync sync",
   "main": "main.js",
   "scripts": {

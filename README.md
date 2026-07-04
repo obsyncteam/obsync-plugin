@@ -2,7 +2,7 @@
 
 [Русская версия](README.ru.md)
 
-[![Version](https://img.shields.io/badge/version-1.6.25-green.svg)](manifest.json)
+[![Version](https://img.shields.io/badge/version-1.7.4-green.svg)](manifest.json)
 [![AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 
 Obsidian plugin for Obsync. It connects an Obsidian vault to a [self-hosted Obsync Community Edition server](https://obsync.ru/ce?utm_source=github&utm_medium=repo_readme) or to the [managed Obsync service](https://obsync.ru/?utm_source=github&utm_medium=repo_readme).
@@ -19,7 +19,7 @@ Obsidian plugin for Obsync. It connects an Obsidian vault to a [self-hosted Obsy
 Download the release archive:
 
 ```text
-obsync_v1.6.25.zip
+obsync_v1.7.4.zip
 ```
 
 Unpack it into your Obsidian vault:
@@ -72,7 +72,7 @@ npm run pack
 Archive name:
 
 ```text
-obsync_v1.6.25.zip
+obsync_v1.7.4.zip
 ```
 
 Archive structure:
